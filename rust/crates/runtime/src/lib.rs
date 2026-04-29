@@ -36,6 +36,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod upstream_credentials;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -112,17 +113,14 @@ pub use mcp_stdio::{
     UnsupportedMcpServer,
 };
 pub use oauth::{
-    clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
-    generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
-    parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
-    OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
-    PkceChallengeMethod, PkceCodePair,
+    clear_oauth_credentials, credentials_path, load_oauth_credentials, save_oauth_credentials,
+    OAuthRefreshRequest, OAuthTokenSet,
 };
+pub use permission_enforcer::{EnforcementResult, PermissionEnforcer};
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
-pub use permission_enforcer::{EnforcementResult, PermissionEnforcer};
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
@@ -166,6 +164,9 @@ pub use stale_branch::{
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+pub use upstream_credentials::{
+    discover_upstream_credentials, UpstreamCredentials, DISCOVERY_DISABLE_ENV,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };

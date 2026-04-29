@@ -1,6 +1,8 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
-use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
+use crate::providers::anthropic::{
+    self, upstream_credential_refresh_fn, AnthropicClient, AuthSource,
+};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -24,10 +26,15 @@ impl ProviderClient {
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
         match providers::detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
-                Some(auth) => AnthropicClient::from_auth(auth),
-                None => AnthropicClient::from_env()?,
-            })),
+            ProviderKind::Anthropic => {
+                let client = match anthropic_auth {
+                    Some(auth) => AnthropicClient::from_auth(auth),
+                    None => AnthropicClient::from_env()?,
+                };
+                Ok(Self::Anthropic(
+                    client.with_auth_refresh(upstream_credential_refresh_fn()),
+                ))
+            }
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),

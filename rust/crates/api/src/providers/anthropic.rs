@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use runtime::format_usd;
 use runtime::{
-    load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
-    OAuthTokenExchangeRequest,
+    discover_upstream_credentials, load_oauth_credentials, save_oauth_credentials, OAuthConfig,
+    OAuthRefreshRequest,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -28,6 +28,15 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+
+/// Callback that produces a fresh [`AuthSource`] on demand.
+///
+/// Wrapped in `Arc` because [`AnthropicClient`] is `Clone` and shares the
+/// callback across clones. The callback is invoked from
+/// [`AnthropicClient::send_with_retry_and_refresh`] when the API returns 401,
+/// allowing the auth to be re-derived from a fresh source (typically
+/// upstream Claude Code's credential store).
+pub type AuthRefreshFn = Arc<dyn Fn() -> Result<AuthSource, ApiError> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -110,10 +119,11 @@ impl From<OAuthTokenSet> for AuthSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
-    auth: AuthSource,
+    auth: Arc<Mutex<AuthSource>>,
+    auth_refresh: Option<AuthRefreshFn>,
     base_url: String,
     max_retries: u32,
     initial_backoff: Duration,
@@ -124,28 +134,31 @@ pub struct AnthropicClient {
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
+impl std::fmt::Debug for AnthropicClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicClient")
+            .field("auth", &"<redacted>")
+            .field("auth_refresh", &self.auth_refresh.as_ref().map(|_| "<fn>"))
+            .field("base_url", &self.base_url)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("max_backoff", &self.max_backoff)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AnthropicClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            http: build_http_client_or_default(),
-            auth: AuthSource::ApiKey(api_key.into()),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_backoff: DEFAULT_INITIAL_BACKOFF,
-            max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
-            session_tracer: None,
-            prompt_cache: None,
-            last_prompt_cache_record: Arc::new(Mutex::new(None)),
-        }
+        Self::from_auth(AuthSource::ApiKey(api_key.into()))
     }
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
         Self {
             http: build_http_client_or_default(),
-            auth,
+            auth: Arc::new(Mutex::new(auth)),
+            auth_refresh: None,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -162,34 +175,50 @@ impl AnthropicClient {
     }
 
     #[must_use]
-    pub fn with_auth_source(mut self, auth: AuthSource) -> Self {
-        self.auth = auth;
+    pub fn with_auth_source(self, auth: AuthSource) -> Self {
+        self.set_auth(auth);
         self
     }
 
     #[must_use]
-    pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
-        match (
-            self.auth.api_key().map(ToOwned::to_owned),
+    pub fn with_auth_token(self, auth_token: Option<String>) -> Self {
+        let current = self.current_auth();
+        let next = match (
+            current.api_key().map(ToOwned::to_owned),
             auth_token.filter(|token| !token.is_empty()),
         ) {
-            (Some(api_key), Some(bearer_token)) => {
-                self.auth = AuthSource::ApiKeyAndBearer {
-                    api_key,
-                    bearer_token,
-                };
-            }
-            (Some(api_key), None) => {
-                self.auth = AuthSource::ApiKey(api_key);
-            }
-            (None, Some(bearer_token)) => {
-                self.auth = AuthSource::BearerToken(bearer_token);
-            }
-            (None, None) => {
-                self.auth = AuthSource::None;
-            }
-        }
+            (Some(api_key), Some(bearer_token)) => AuthSource::ApiKeyAndBearer {
+                api_key,
+                bearer_token,
+            },
+            (Some(api_key), None) => AuthSource::ApiKey(api_key),
+            (None, Some(bearer_token)) => AuthSource::BearerToken(bearer_token),
+            (None, None) => AuthSource::None,
+        };
+        self.set_auth(next);
         self
+    }
+
+    /// Install a callback used to refresh the auth source when the API
+    /// returns 401. See [`AuthRefreshFn`] for semantics.
+    #[must_use]
+    pub fn with_auth_refresh(mut self, refresh: AuthRefreshFn) -> Self {
+        self.auth_refresh = Some(refresh);
+        self
+    }
+
+    fn current_auth(&self) -> AuthSource {
+        self.auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_auth(&self, next: AuthSource) {
+        *self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     }
 
     #[must_use]
@@ -276,8 +305,8 @@ impl AnthropicClient {
     }
 
     #[must_use]
-    pub fn auth_source(&self) -> &AuthSource {
-        &self.auth
+    pub fn auth_source(&self) -> AuthSource {
+        self.current_auth()
     }
 
     pub async fn send_message(
@@ -297,7 +326,7 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = self.send_with_retry_and_refresh(&request).await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
@@ -342,7 +371,7 @@ impl AnthropicClient {
     ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry_and_refresh(&request.clone().with_streaming())
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
@@ -355,26 +384,6 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
-        })
-    }
-
-    pub async fn exchange_oauth_code(
-        &self,
-        config: &OAuthConfig,
-        request: &OAuthTokenExchangeRequest,
-    ) -> Result<OAuthTokenSet, ApiError> {
-        let response = self
-            .http
-            .post(&config.token_url)
-            .header("content-type", "application/x-www-form-urlencoded")
-            .form(&request.form_params())
-            .send()
-            .await
-            .map_err(ApiError::from)?;
-        let response = expect_success(response).await?;
-        let body = response.text().await.map_err(ApiError::from)?;
-        serde_json::from_str::<OAuthTokenSet>(&body).map_err(|error| {
-            ApiError::json_deserialize("Anthropic OAuth (exchange)", "n/a", &body, error)
         })
     }
 
@@ -435,7 +444,8 @@ impl AnthropicClient {
                         last_error = Some(error);
                     }
                     Err(error) => {
-                        let error = enrich_bearer_auth_error(error, &self.auth);
+                        let auth_snapshot = self.current_auth();
+                        let error = enrich_bearer_auth_error(error, &auth_snapshot);
                         self.record_request_failure(attempts, &error);
                         return Err(error);
                     }
@@ -479,11 +489,55 @@ impl AnthropicClient {
             .http
             .post(request_url)
             .header("content-type", "application/json");
-        let mut request_builder = self.auth.apply(request_builder);
-        for (header_name, header_value) in self.request_profile.header_pairs() {
+        let auth_snapshot = self.current_auth();
+        let mut request_builder = auth_snapshot.apply(request_builder);
+        let header_pairs = if auth_snapshot.bearer_token().is_some() {
+            // Real Claude Code sends `oauth-2025-04-20` in the `anthropic-beta`
+            // header to authorize Bearer-token auth against api.anthropic.com.
+            // Without it, the server rejects valid OAuth access tokens.
+            // Source: extracted from the Claude Code 2.1.123 binary string
+            // table — `$M4="files-api-2025-04-14,oauth-2025-04-20"`.
+            augment_anthropic_beta(self.request_profile.header_pairs(), OAUTH_BETA_HEADER_VALUE)
+        } else {
+            self.request_profile.header_pairs()
+        };
+        for (header_name, header_value) in header_pairs {
             request_builder = request_builder.header(header_name, header_value);
         }
         request_builder
+    }
+
+    /// Wraps [`Self::send_with_retry`] with a one-shot 401-refresh path.
+    ///
+    /// On HTTP 401 from the underlying retry loop, if an [`AuthRefreshFn`]
+    /// has been installed via [`Self::with_auth_refresh`], we call it,
+    /// install the new auth source, and retry the request once. This is
+    /// distinct from the existing exponential-backoff retry — it covers the
+    /// case where the access token expired mid-session (e.g. upstream Claude
+    /// Code refreshed the file out from under us).
+    ///
+    /// If the refresh callback errors, or the retried request also returns
+    /// 401, the original error is returned unchanged.
+    async fn send_with_retry_and_refresh(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<reqwest::Response, ApiError> {
+        match self.send_with_retry(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if !is_unauthorized(&error) {
+                    return Err(error);
+                }
+                let Some(refresh) = self.auth_refresh.clone() else {
+                    return Err(error);
+                };
+                let Ok(refreshed) = refresh() else {
+                    return Err(error);
+                };
+                self.set_auth(refreshed);
+                self.send_with_retry(request).await
+            }
+        }
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -600,7 +654,9 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     // splitmix64 finalizer — mixes the low bits so large bases still see
     // jitter across their full range instead of being clamped to subsec nanos.
@@ -629,6 +685,9 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
+        if let Some(creds) = discover_upstream_credentials().map_err(ApiError::from)? {
+            return Ok(Self::BearerToken(creds.access_token));
+        }
         Err(anthropic_missing_credentials())
     }
 }
@@ -648,8 +707,14 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 }
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
-    Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+    if read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+    {
+        return Ok(true);
+    }
+    Ok(discover_upstream_credentials()
+        .map_err(ApiError::from)?
+        .is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
@@ -669,7 +734,24 @@ where
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
+    if let Some(creds) = discover_upstream_credentials().map_err(ApiError::from)? {
+        return Ok(AuthSource::BearerToken(creds.access_token));
+    }
     Err(anthropic_missing_credentials())
+}
+
+/// Build an [`AuthRefreshFn`] that re-discovers credentials from upstream
+/// Claude Code on every call. Pair with
+/// [`AnthropicClient::with_auth_refresh`] so 401 responses trigger a
+/// re-read instead of failing the session.
+#[must_use]
+pub fn upstream_credential_refresh_fn() -> AuthRefreshFn {
+    Arc::new(
+        || match discover_upstream_credentials().map_err(ApiError::from)? {
+            Some(creds) => Ok(AuthSource::BearerToken(creds.access_token)),
+            None => Err(anthropic_missing_credentials()),
+        },
+    )
 }
 
 fn resolve_saved_oauth_token_set(
@@ -890,6 +972,50 @@ const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
 }
 
+fn is_unauthorized(error: &ApiError) -> bool {
+    matches!(error, ApiError::Api { status, .. } if status.as_u16() == 401)
+}
+
+/// `anthropic-beta` flag that authorizes OAuth Bearer-token auth against
+/// `api.anthropic.com`. Real Claude Code sends this on every request when
+/// using Bearer auth; without it, the server rejects the credential even
+/// when the token itself is valid.
+const OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20";
+
+/// Take the request profile's header pairs and append `extra_beta` to the
+/// `anthropic-beta` header value (creating the header if it isn't present).
+fn augment_anthropic_beta(
+    pairs: Vec<(String, String)>,
+    extra_beta: &str,
+) -> Vec<(String, String)> {
+    let mut found = false;
+    let mut augmented: Vec<(String, String)> = pairs
+        .into_iter()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("anthropic-beta") {
+                found = true;
+                let already_present = value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|item| item.eq_ignore_ascii_case(extra_beta));
+                if already_present {
+                    (name, value)
+                } else if value.is_empty() {
+                    (name, extra_beta.to_string())
+                } else {
+                    (name, format!("{value},{extra_beta}"))
+                }
+            } else {
+                (name, value)
+            }
+        })
+        .collect();
+    if !found {
+        augmented.push(("anthropic-beta".to_string(), extra_beta.to_string()));
+    }
+    augmented
+}
+
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
 /// and rejected with HTTP 401 "Invalid bearer token" when sent as a Bearer
 /// token via `ANTHROPIC_AUTH_TOKEN`. This happens often enough in the wild
@@ -1085,11 +1211,13 @@ mod tests {
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, "1");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
+        std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV);
     }
 
     #[test]
@@ -1097,12 +1225,14 @@ mod tests {
         let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, "1");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV);
     }
 
     #[test]
@@ -1157,6 +1287,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, "1");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1170,6 +1301,7 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV);
         cleanup_temp_config_home(&config_home);
     }
 
@@ -1228,6 +1360,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, "1");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1242,6 +1375,33 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV);
+        cleanup_temp_config_home(&config_home);
+    }
+
+    #[test]
+    fn resolve_startup_auth_source_falls_back_to_upstream_credentials() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("mkdir config home");
+        let creds_path = config_home.join(".credentials.json");
+        std::fs::write(
+            &creds_path,
+            r#"{"claudeAiOauth":{"accessToken":"upstream-tok","expiresAt":9999999999000}}"#,
+        )
+        .expect("write upstream creds");
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_home);
+
+        let auth =
+            resolve_startup_auth_source(|| Ok(None)).expect("upstream credentials should resolve");
+        assert_eq!(auth.bearer_token(), Some("upstream-tok"));
+        assert_eq!(auth.api_key(), None);
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         cleanup_temp_config_home(&config_home);
     }
 
@@ -1545,6 +1705,57 @@ mod tests {
         assert_eq!(
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn augment_anthropic_beta_appends_to_existing_header() {
+        let pairs = vec![
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            (
+                "anthropic-beta".to_string(),
+                "claude-code-20250219,prompt-caching-scope-2026-01-05".to_string(),
+            ),
+        ];
+        let augmented = super::augment_anthropic_beta(pairs, "oauth-2025-04-20");
+        let beta = augmented
+            .iter()
+            .find(|(k, _)| k == "anthropic-beta")
+            .expect("anthropic-beta header present")
+            .1
+            .clone();
+        assert_eq!(
+            beta,
+            "claude-code-20250219,prompt-caching-scope-2026-01-05,oauth-2025-04-20"
+        );
+        assert_eq!(augmented.len(), 2, "should not add a duplicate header row");
+    }
+
+    #[test]
+    fn augment_anthropic_beta_creates_header_when_absent() {
+        let pairs = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
+        let augmented = super::augment_anthropic_beta(pairs, "oauth-2025-04-20");
+        assert_eq!(augmented.len(), 2);
+        assert_eq!(
+            augmented[1],
+            (
+                "anthropic-beta".to_string(),
+                "oauth-2025-04-20".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn augment_anthropic_beta_is_idempotent_when_already_present() {
+        let pairs = vec![(
+            "anthropic-beta".to_string(),
+            "claude-code-20250219,oauth-2025-04-20".to_string(),
+        )];
+        let augmented = super::augment_anthropic_beta(pairs, "oauth-2025-04-20");
+        assert_eq!(
+            augmented[0].1,
+            "claude-code-20250219,oauth-2025-04-20",
+            "must not duplicate existing beta entries"
         );
     }
 

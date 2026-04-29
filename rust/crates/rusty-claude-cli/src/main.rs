@@ -7580,6 +7580,7 @@ impl AnthropicRuntimeClient {
                 let auth = resolve_cli_auth_source()?;
                 let inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
+                    .with_auth_refresh(api::upstream_credential_refresh_fn())
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
@@ -9702,9 +9703,14 @@ mod tests {
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        let original_discovery_disable = std::env::var(runtime::DISCOVERY_DISABLE_ENV).ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        // Suppress upstream-Claude-Code discovery so the test asserts the
+        // claw-saved-oauth-is-ignored contract independently of whether the
+        // host has a real Claude Code install on disk.
+        std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, "1");
 
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -9728,6 +9734,10 @@ mod tests {
         match original_auth_token {
             Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
             None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        match original_discovery_disable {
+            Some(value) => std::env::set_var(runtime::DISCOVERY_DISABLE_ENV, value),
+            None => std::env::remove_var(runtime::DISCOVERY_DISABLE_ENV),
         }
         std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
 
