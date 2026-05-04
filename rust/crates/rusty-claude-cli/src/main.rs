@@ -951,6 +951,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Diff { output_format })
         }
+        // `claw permissions <mode>` falls through to the LLM when called
+        // with a subcommand argument because parse_single_word_command_alias
+        // only intercepts the bare single-word form. Catch all multi-word
+        // forms here and return a structured guidance error so no network
+        // call or session is created.
+        "permissions" => Err(format!(
+            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
+        )),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
