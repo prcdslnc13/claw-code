@@ -24,10 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -387,8 +388,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::PrintSystemPrompt {
             cwd,
             date,
+            model,
             output_format,
-        } => print_system_prompt(cwd, date, output_format)?,
+        } => print_system_prompt(cwd, date, &model, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
         CliAction::ResumeSession {
             session_path,
@@ -520,6 +522,7 @@ enum CliAction {
     PrintSystemPrompt {
         cwd: PathBuf,
         date: String,
+        model: String,
         output_format: CliOutputFormat,
     },
     Version {
@@ -975,7 +978,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
-        "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
@@ -1653,6 +1656,7 @@ fn filter_tool_specs(
 
 fn parse_system_prompt_args(
     args: &[String],
+    model: String,
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
@@ -1689,6 +1693,7 @@ fn parse_system_prompt_args(
     Ok(CliAction::PrintSystemPrompt {
         cwd,
         date,
+        model,
         output_format,
     })
 }
@@ -2655,9 +2660,16 @@ fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn st
 fn print_system_prompt(
     cwd: PathBuf,
     date: String,
+    model: &str,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = load_system_prompt(
+        cwd,
+        date,
+        env::consts::OS,
+        "unknown",
+        model_family_identity_for(model),
+    )?;
     let message = sections.join(
         "
 
@@ -4252,7 +4264,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -4390,6 +4402,10 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                let final_text = final_assistant_text(&summary);
+                if !final_text.is_empty() {
+                    println!("{final_text}");
+                }
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -6715,6 +6731,7 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -6901,6 +6918,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(String::new());
                     }
                 }
+                ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
@@ -6954,12 +6972,13 @@ fn short_tool_id(id: &str) -> String {
     format!("{prefix}…")
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
+        model_family_identity_for(model),
     )?)
 }
 
@@ -9014,26 +9033,29 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -9477,7 +9499,9 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("Detail           Input tokens exceed the configured limit of 922000 tokens."),
+            rendered.contains(
+                "Detail           Input tokens exceed the configured limit of 922000 tokens."
+            ),
             "{rendered}"
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
@@ -10216,6 +10240,7 @@ mod tests {
 
     #[test]
     fn parses_system_prompt_options() {
+        // given: system-prompt options for cwd and date
         let args = vec![
             "system-prompt".to_string(),
             "--cwd".to_string(),
@@ -10223,11 +10248,17 @@ mod tests {
             "--date".to_string(),
             "2026-04-01".to_string(),
         ];
+
+        // when: parsing the direct system-prompt command
+        let action = parse_args(&args).expect("args should parse");
+
+        // then: the action carries prompt options and default model
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            action,
             CliAction::PrintSystemPrompt {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
+                model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -10237,6 +10268,27 @@ mod tests {
     // many input shapes. Splitting it would obscure the intent (one failure
     // surface, many paths in).
     #[allow(clippy::too_many_lines)]
+    #[test]
+    fn parses_global_model_for_system_prompt() {
+        // given: a global OpenAI-compatible model before system-prompt
+        let args = vec![
+            "--model".to_string(),
+            "openai/gpt-4.1-mini".to_string(),
+            "system-prompt".to_string(),
+        ];
+
+        // when: parsing the CLI arguments
+        let action = parse_args(&args).expect("args should parse");
+
+        // then: the system-prompt action carries the selected model
+        match action {
+            CliAction::PrintSystemPrompt { model, .. } => {
+                assert_eq!(model, "openai/gpt-4.1-mini");
+            }
+            other => panic!("expected PrintSystemPrompt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
