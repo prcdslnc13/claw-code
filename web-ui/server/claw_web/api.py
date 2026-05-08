@@ -10,10 +10,21 @@ import asyncio
 import json
 import logging
 import os
+import re
 import select
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Strip alt-screen mode switches from the PTY stream. With pipe-pane
+# delivering claw's raw output, claw's `\e[?1049h` enters alt-screen
+# in xterm.js where there's no scrollback AND its visible area paints
+# unpredictably for users. Removing the toggles keeps everything in
+# main-screen where xterm's 1000-line scrollback fills naturally.
+# Sentinel doesn't strip but their setup avoids alt-screen by having
+# tmux paint its own grid; pipe-pane bypasses tmux's painting so we
+# see claw's raw escape sequences and need to filter ourselves.
+_ALT_SCREEN_RE = re.compile(rb"\x1b\[\?(?:47|1047|1048|1049)[hl]")
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -269,44 +280,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return
 
         try:
-            master_fd, attach_proc = tmux_manager.attach_pty(session_id)
+            out_fd, in_fd = tmux_manager.open_pipes(session_id)
         except Exception as e:
-            log.exception("tmux attach failed")
+            log.exception("tmux pipe open failed")
             await ws.send_json({"type": "status", "state": "error",
-                                "message": f"tmux attach failed: {e}"})
+                                "message": f"tmux pipe open failed: {e}"})
             await ws.close()
             return
 
         # Resize once more — covers the reconnect case where the tmux
         # session existed at a different size than the browser wants now.
-        tmux_manager.resize_pty(master_fd, session_id, cols, rows)
+        tmux_manager.resize_pane(session_id, cols, rows)
 
         await ws.send_json({"type": "status", "state": "connected"})
 
         loop = asyncio.get_running_loop()
         stop = threading.Event()
 
-        # Background thread: read PTY non-blocking, push to WS via the
-        # asyncio loop. select() on a 100ms tick keeps stop_event responsive.
-        def pty_reader():
+        # Background thread: read raw pane output from the pipe-pane
+        # output fifo, ship to WS as `output` events. xterm.js gets
+        # the same byte stream a normal terminal would see, so its
+        # built-in 1000-line scrollback fills naturally. The fifo is
+        # opened O_RDWR so empty reads aren't EOF — they just mean
+        # "no data right now" and we keep polling until the WS closes.
+        def pipe_reader():
             while not stop.is_set():
                 try:
-                    ready, _, _ = select.select([master_fd], [], [], 0.1)
+                    ready, _, _ = select.select([out_fd], [], [], 0.1)
                 except (OSError, ValueError):
                     break
                 if not ready:
                     continue
                 try:
-                    data = os.read(master_fd, 4096)
+                    data = os.read(out_fd, 4096)
                 except (BlockingIOError, OSError):
                     continue
                 if not data:
-                    asyncio.run_coroutine_threadsafe(
-                        ws.send_json({"type": "status", "state": "ended",
-                                      "message": "claw exited"}),
-                        loop,
-                    )
-                    break
+                    continue
+                data = _ALT_SCREEN_RE.sub(b"", data)
+                if not data:
+                    continue
                 text = data.decode("utf-8", errors="replace")
                 fut = asyncio.run_coroutine_threadsafe(
                     ws.send_json({"type": "output", "data": text}),
@@ -317,7 +330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except Exception:
                     break
 
-        reader = threading.Thread(target=pty_reader, daemon=True)
+        reader = threading.Thread(target=pipe_reader, daemon=True)
         reader.start()
 
         try:
@@ -333,27 +346,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if not data:
                         continue
                     try:
-                        os.write(master_fd, data.encode("utf-8"))
+                        os.write(in_fd, data.encode("utf-8"))
                     except OSError:
                         break
                 elif kind == "resize":
                     new_cols = int(msg.get("cols") or cols)
                     new_rows = int(msg.get("rows") or rows)
-                    tmux_manager.resize_pty(master_fd, session_id, new_cols, new_rows)
-                # Drop any other message types silently.
+                    tmux_manager.resize_pane(session_id, new_cols, new_rows)
         except WebSocketDisconnect:
             pass
         finally:
             stop.set()
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            try:
-                attach_proc.terminate()
-            except (ProcessLookupError, OSError):
-                pass
+            # Wait for the reader thread to notice the stop flag and
+            # exit cleanly BEFORE closing its fds — otherwise the
+            # in-flight read() will fail with EBADF.
             reader.join(timeout=2.0)
+            for fd in (out_fd, in_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             # NOTE: we deliberately do NOT kill the tmux session here.
             # The user can reconnect and pick up the running claw.
 

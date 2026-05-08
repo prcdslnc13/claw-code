@@ -9,10 +9,14 @@
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="/static/icons/icon-192.png" />
   <link rel="apple-touch-icon" href="/static/icons/icon-192.png" />
-  <!-- xterm.js for the terminal panel. Pinned to known-good versions. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js" defer></script>
+  <!-- xterm.js for the terminal panel. Pinned to the same versions
+       Sentinel ships (verified in their package-lock.json: 6.0.0 +
+       0.11.0). Older releases routed wheel events to the application
+       as arrow-key escape sequences when an app set application-
+       cursor-keys mode (rustyline does), which broke scrollback. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js" defer></script>
 </head>
 <body>
   <div id="app">
