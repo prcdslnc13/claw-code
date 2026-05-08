@@ -304,6 +304,24 @@ function openTerm(sessionId) {
         state.termWS.send(JSON.stringify({ type: 'input', data }));
       }
     });
+
+    // Drag-to-select + Ctrl+C/V are handled by xterm@6.0.0 defaults
+    // (with tmux mouse mode OFF). Wheel-to-scrollback needs an
+    // override: claw's REPL uses rustyline, which sets application-
+    // cursor-keys mode (DECCKM), and xterm's default in that mode
+    // forwards wheel events as up/down arrow escape sequences. The
+    // custom handler suppresses that and drives scrollLines directly.
+    if (typeof state.term.attachCustomWheelEventHandler === 'function') {
+      state.term.attachCustomWheelEventHandler((ev) => {
+        const stepLines = ev.deltaMode === 1
+          ? ev.deltaY
+          : Math.round(ev.deltaY / 16);
+        if (stepLines !== 0) {
+          try { state.term.scrollLines(stepLines); } catch {}
+        }
+        return false;
+      });
+    }
   }
 
   state.term.clear();
@@ -319,10 +337,10 @@ function openTerm(sessionId) {
   ws.addEventListener('open', () => {
     state.termStatus = 'connected';
     render();
-    // The terminal-panel just became visible (the [hidden] toggle ran in
-    // render()), so the FitAddon's first measurement may have been zero.
-    // Re-fit on the next frame, then once more after a beat to cover
-    // late layout (e.g. scrollbar appearing). Then send the resize.
+    // The terminal-panel just became visible (the [hidden] toggle ran
+    // in render()), so the FitAddon's first measurement may have been
+    // zero. Re-fit on the next frame, then once more after a beat to
+    // cover late layout (e.g. scrollbar appearing). Then send resize.
     requestAnimationFrame(() => {
       try { state.termFit && state.termFit.fit(); } catch {}
       sendTermResize();
