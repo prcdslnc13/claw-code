@@ -294,6 +294,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         await ws.send_json({"type": "status", "state": "connected"})
 
+        # Send the current pane contents as a one-shot output event so a
+        # browser-refresh / reconnect sees the existing claw TUI rather
+        # than a blank terminal. pipe-pane only streams NEW output from
+        # the moment it's enabled; without this replay, the new xterm
+        # stays blank until claw writes something next (which it
+        # doesn't, until the user types).
+        captured = tmux_manager.capture_pane(session_id)
+        if captured:
+            captured = _ALT_SCREEN_RE.sub(b"", captured)
+            if captured:
+                await ws.send_json({
+                    "type": "output",
+                    "data": captured.decode("utf-8", errors="replace"),
+                })
+
         loop = asyncio.get_running_loop()
         stop = threading.Event()
 
