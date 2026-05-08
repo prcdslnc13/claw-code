@@ -236,6 +236,36 @@ def open_pipes(session_id: int) -> tuple[int, int]:
     return out_fd, in_fd
 
 
+def capture_pane(session_id: int) -> bytes:
+    """Capture the visible pane content with ANSI attribute escapes,
+    so a freshly-attached browser sees the existing claw TUI rather
+    than a blank terminal.
+
+    pipe-pane only streams NEW output from the moment it's enabled;
+    `tmux attach-session` would have replayed the current pane on
+    attach, but we deliberately don't use attach. capture-pane gives
+    us the same one-shot replay semantics as a stand-in.
+
+    capture-pane separates rows with `\\n` only (no CR), so the result
+    needs `\\n → \\r\\n` normalization before being fed to xterm or
+    every line after the first will staircase down without returning
+    to column 0.
+    """
+    try:
+        tmux = _tmux_path()
+    except RuntimeError:
+        return b""
+    cfg = _ensure_tmux_config()
+    name = session_name(session_id)
+    r = subprocess.run(
+        [tmux, "-f", cfg, "capture-pane", "-p", "-e", "-t", name],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return b""
+    return r.stdout.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
 def resize_pane(session_id: int, cols: int, rows: int) -> None:
     """Resize the tmux pane (and its window) to match the browser's
     xterm.js dimensions. Without this, claw thinks the terminal is
