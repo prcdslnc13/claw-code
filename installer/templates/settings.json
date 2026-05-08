@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": ["bash(curl:*)", "bash(wget:*)", "bash(sudo:*)", "bash(rm:*)"],
+    "ask": ["bash"]
+  }
+}

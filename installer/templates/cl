@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# claw wrapper: injects LMStudio (OpenAI-compat) defaults. Override either
+# variable from the environment to point at a different backend.
+set -euo pipefail
+exec env \
+    OPENAI_BASE_URL="${OPENAI_BASE_URL:-__LMSTUDIO_URL__}" \
+    OPENAI_API_KEY="${OPENAI_API_KEY:-unused}" \
+    claw "$@"
