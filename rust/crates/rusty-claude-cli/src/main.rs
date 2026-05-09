@@ -9516,6 +9516,36 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Point `CLAW_CONFIG_HOME` at an empty temp dir for the guard's scope and
+    /// restore the previous value on drop. Without this, `parse_args` tests
+    /// inherit whatever permissionMode the host's `~/.claw/settings.json`
+    /// carries — a real failure mode when the daily-driver default is e.g.
+    /// `acceptEdits`. Pair with `env_lock` so concurrent tests don't race.
+    struct ConfigHomeGuard {
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl ConfigHomeGuard {
+        fn isolate() -> Self {
+            let path = temp_dir();
+            std::fs::create_dir_all(&path).expect("temp config home should create");
+            let previous = std::env::var_os("CLAW_CONFIG_HOME");
+            std::env::set_var("CLAW_CONFIG_HOME", &path);
+            Self { previous, path }
+        }
+    }
+
+    impl Drop for ConfigHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn streaming_enabled_from_env_default_is_on() {
         let _guard = env_lock();
@@ -9618,6 +9648,7 @@ mod tests {
     #[test]
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
@@ -9826,6 +9857,7 @@ mod tests {
     #[test]
     fn parses_prompt_subcommand() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "prompt".to_string(),
@@ -9915,6 +9947,7 @@ mod tests {
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--output-format=json".to_string(),
@@ -9943,6 +9976,7 @@ mod tests {
     fn parses_compact_flag_for_prompt_mode() {
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--compact".to_string(),
@@ -9990,6 +10024,7 @@ mod tests {
     #[test]
     fn resolves_model_aliases_in_args() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--model".to_string(),
@@ -10146,6 +10181,7 @@ mod tests {
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
@@ -10720,6 +10756,7 @@ mod tests {
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
@@ -11399,6 +11436,9 @@ mod tests {
 
     #[test]
     fn prompt_subcommand_allows_literal_typo_word() {
+        let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["prompt".to_string(), "doctorr".to_string()])
                 .expect("explicit prompt subcommand should allow literal typo word"),
@@ -11423,6 +11463,7 @@ mod tests {
         // doesn't pick up a stale .claw/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
         let _guard = env_lock();
+        let _config_home = ConfigHomeGuard::isolate();
         let root = temp_dir();
         let cwd = root.join("project");
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
