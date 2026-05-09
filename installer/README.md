@@ -104,6 +104,8 @@ host web-ui because it depends on `tmux`.
 -Prefix DIR             Install prefix (default: %LOCALAPPDATA%\Programs\claw)
 -SourceDir DIR          Native Windows checkout (default: %USERPROFILE%\src\claw-code)
 -LmStudioUrl URL        OPENAI_BASE_URL for the cl.ps1 wrapper
+-DefaultModel MODEL     Default --model baked into cl.ps1 and settings.json
+                        (default: openai/qwen/qwen3.5-9b)
 -Release | -Debug       Cargo profile (default: release)
 -NoBinary               Skip building and installing claw.exe
 -NoWrapper              Skip installing cl.ps1
@@ -135,6 +137,7 @@ claw 0.1.0 (...)
 
 $ cat ~/.claw/settings.json | python3 -m json.tool | head
 {
+    "model": "openai/qwen/qwen3.5-9b",
     "permissions": {
         "defaultMode": "default",
         ...

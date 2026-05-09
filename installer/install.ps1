@@ -18,10 +18,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$Prefix      = (Join-Path $env:LOCALAPPDATA 'Programs\claw'),
-    [string]$SourceDir   = (Join-Path $env:USERPROFILE 'src\claw-code'),
-    [string]$LmStudioUrl = 'http://localhost:1234/v1',
-    [string]$WslDistro   = '',
+    [string]$Prefix       = (Join-Path $env:LOCALAPPDATA 'Programs\claw'),
+    [string]$SourceDir    = (Join-Path $env:USERPROFILE 'src\claw-code'),
+    [string]$LmStudioUrl  = 'http://localhost:1234/v1',
+    [string]$DefaultModel = 'openai/qwen/qwen3.5-9b',
+    [string]$WslDistro    = '',
     [switch]$Release,
     [switch]$Debug,
     [switch]$NoBinary,
@@ -75,7 +76,8 @@ $script:TotalSteps += 1                              # verify
 # --- banner -----------------------------------------------------------------
 
 Write-Host "claw installer (fork layer, Windows)" -ForegroundColor White
-Write-Host ("  prefix={0}  profile={1}  lmstudio={2}" -f $Prefix, $BuildProfile, $LmStudioUrl) -ForegroundColor DarkGray
+Write-Host ("  prefix={0}  profile={1}" -f $Prefix, $BuildProfile) -ForegroundColor DarkGray
+Write-Host ("  lmstudio={0}  model={1}" -f $LmStudioUrl, $DefaultModel) -ForegroundColor DarkGray
 if ($NoBootstrap) {
     Write-Host "  bootstrap=off (will only check; -NoBootstrap given)" -ForegroundColor DarkGray
 } else {
@@ -323,8 +325,9 @@ if (-not $NoSettings) {
     if (Test-Path $settingsFile) {
         Write-Info ("{0} already exists — leaving untouched" -f $settingsFile)
     } else {
-        Copy-Item $template $settingsFile
-        Write-OK ("wrote {0}" -f $settingsFile)
+        (Get-Content -Raw $template).Replace('__DEFAULT_MODEL__', $DefaultModel) |
+            Set-Content -Path $settingsFile
+        Write-OK ("wrote {0} (model={1})" -f $settingsFile, $DefaultModel)
     }
 }
 
@@ -335,8 +338,11 @@ if (-not $NoWrapper) {
     if (-not (Test-Path $Prefix)) { New-Item -ItemType Directory -Path $Prefix -Force | Out-Null }
     $template = Join-Path $PSScriptRoot 'templates\cl.ps1'
     $wrapper  = Join-Path $Prefix 'cl.ps1'
-    (Get-Content -Raw $template).Replace('__LMSTUDIO_URL__', $LmStudioUrl) | Set-Content -Path $wrapper
-    Write-OK ("wrote {0} (OPENAI_BASE_URL={1})" -f $wrapper, $LmStudioUrl)
+    (Get-Content -Raw $template).
+        Replace('__LMSTUDIO_URL__', $LmStudioUrl).
+        Replace('__DEFAULT_MODEL__', $DefaultModel) |
+        Set-Content -Path $wrapper
+    Write-OK ("wrote {0} (OPENAI_BASE_URL={1}, --model={2})" -f $wrapper, $LmStudioUrl, $DefaultModel)
 }
 
 # --- step 8: web-ui via WSL2 ----------------------------------------------
@@ -381,7 +387,7 @@ Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
 Write-Host ("  Source:  {0}" -f $SourceDir)
 if (-not $NoBinary)   { Write-Host ("  Binary:  {0}\claw.exe" -f $Prefix) }
-if (-not $NoWrapper)  { Write-Host ("  Wrapper: {0}\cl.ps1  (OPENAI_BASE_URL={1})" -f $Prefix, $LmStudioUrl) }
+if (-not $NoWrapper)  { Write-Host ("  Wrapper: {0}\cl.ps1  (OPENAI_BASE_URL={1}, --model={2})" -f $Prefix, $LmStudioUrl, $DefaultModel) }
 if (-not $NoSettings) { Write-Host ("  Config:  {0}\.claw\settings.json" -f $env:USERPROFILE) }
 if (-not $NoWebUi)    { Write-Host ("  Web-UI:  inside WSL2 distro '{0}' at <wsl-source>/web-ui/.venv/bin/claw-web" -f $WslDistro) }
 
