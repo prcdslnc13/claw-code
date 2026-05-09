@@ -17,6 +17,7 @@ set -euo pipefail
 INSTALL_PREFIX="${HOME}/.local"
 SOURCE_DIR=""
 LMSTUDIO_URL="http://localhost:1234/v1"
+DEFAULT_MODEL="openai/qwen/qwen3.5-9b"
 BUILD_PROFILE="release"
 DO_WEB_UI=1
 DO_WRAPPER=1
@@ -58,6 +59,9 @@ Options:
   --source-dir DIR       Use this checkout instead of cloning
   --lmstudio-url URL     OPENAI_BASE_URL baked into the cl wrapper
                          (default: http://localhost:1234/v1)
+  --default-model MODEL  Default --model baked into the cl wrapper and
+                         ~/.claw/settings.json template
+                         (default: openai/qwen/qwen3.5-9b)
   --release | --debug    Build profile passed to root install.sh (default: release)
   --no-binary            Skip building and installing the claw binary
   --no-wrapper           Skip installing the cl wrapper
@@ -79,6 +83,7 @@ while [ "$#" -gt 0 ]; do
         --prefix)         INSTALL_PREFIX="$2"; shift 2 ;;
         --source-dir)     SOURCE_DIR="$2"; shift 2 ;;
         --lmstudio-url)   LMSTUDIO_URL="$2"; shift 2 ;;
+        --default-model)  DEFAULT_MODEL="$2"; shift 2 ;;
         --release)        BUILD_PROFILE="release"; shift ;;
         --debug)          BUILD_PROFILE="debug"; shift ;;
         --no-binary)      DO_BINARY=0; DO_BUILD=0; shift ;;
@@ -137,7 +142,8 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installer failed (exit ${rc})"; pri
 # --- banner ------------------------------------------------------------------
 
 printf '%sclaw installer (fork layer)%s\n' "${C_BOLD}" "${C_RESET}"
-printf '%s  prefix=%s  profile=%s  lmstudio=%s%s\n' "${C_DIM}" "${INSTALL_PREFIX}" "${BUILD_PROFILE}" "${LMSTUDIO_URL}" "${C_RESET}"
+printf '%s  prefix=%s  profile=%s%s\n' "${C_DIM}" "${INSTALL_PREFIX}" "${BUILD_PROFILE}" "${C_RESET}"
+printf '%s  lmstudio=%s  model=%s%s\n' "${C_DIM}" "${LMSTUDIO_URL}" "${DEFAULT_MODEL}" "${C_RESET}"
 if [ "${DO_BOOTSTRAP}" = "1" ]; then
     printf '%s  bootstrap=on (will auto-install rust/tmux/python/brew if missing)%s\n' "${C_DIM}" "${C_RESET}"
 else
@@ -505,8 +511,10 @@ if [ "${DO_SETTINGS}" = "1" ]; then
     if [ -f "${SETTINGS_FILE}" ]; then
         info "${SETTINGS_FILE} already exists — leaving untouched"
     else
-        install -m 0644 "${SCRIPT_DIR}/templates/settings.json" "${SETTINGS_FILE}"
-        ok "wrote ${SETTINGS_FILE}"
+        sed "s|__DEFAULT_MODEL__|${DEFAULT_MODEL}|g" \
+            "${SCRIPT_DIR}/templates/settings.json" > "${SETTINGS_FILE}"
+        chmod 0644 "${SETTINGS_FILE}"
+        ok "wrote ${SETTINGS_FILE} (model=${DEFAULT_MODEL})"
     fi
 fi
 
@@ -518,10 +526,12 @@ if [ "${DO_WRAPPER}" = "1" ]; then
     mkdir -p "${BIN_DIR}"
     WRAPPER="${BIN_DIR}/cl"
     TEMPLATE="${SCRIPT_DIR}/templates/cl"
-    # Use a sentinel-aware sed (works with /, : in URL); pipe-delimited so / in URL isn't a problem.
-    sed "s|__LMSTUDIO_URL__|${LMSTUDIO_URL}|g" "${TEMPLATE}" > "${WRAPPER}"
+    # Pipe-delimited sed so the / in URLs and model names is safe.
+    sed -e "s|__LMSTUDIO_URL__|${LMSTUDIO_URL}|g" \
+        -e "s|__DEFAULT_MODEL__|${DEFAULT_MODEL}|g" \
+        "${TEMPLATE}" > "${WRAPPER}"
     chmod 0755 "${WRAPPER}"
-    ok "wrote ${WRAPPER} (OPENAI_BASE_URL=${LMSTUDIO_URL})"
+    ok "wrote ${WRAPPER} (OPENAI_BASE_URL=${LMSTUDIO_URL}, --model=${DEFAULT_MODEL})"
 fi
 
 # --- step 8: web-ui bootstrap -----------------------------------------------

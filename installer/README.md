@@ -83,6 +83,9 @@ host web-ui because it depends on `tmux`.
 --source-dir DIR        Use this checkout instead of cloning
 --lmstudio-url URL      OPENAI_BASE_URL baked into the cl wrapper
                         (default: http://localhost:1234/v1)
+--default-model MODEL   Default --model baked into the cl wrapper and
+                        ~/.claw/settings.json template
+                        (default: openai/qwen/qwen3.5-9b)
 --release | --debug     Build profile (default: release)
 --no-binary             Skip building and installing the claw binary
 --no-wrapper            Skip installing the cl wrapper

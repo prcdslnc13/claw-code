@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 # claw wrapper: injects LMStudio (OpenAI-compat) defaults. Override either
 # variable from the environment to point at a different backend.
+#
+# Also injects a default --model when the caller didn't pass one. The
+# default also lives in ~/.claw/settings.json (`"model": "openai/..."`)
+# but `claw status` and `claw prompt` resolve the model on different
+# paths on the current build — prompt mode doesn't honor the
+# config-resolved model for provider routing — so we inject explicitly.
 set -euo pipefail
+
+DEFAULT_MODEL="__DEFAULT_MODEL__"
+
+HAS_MODEL=0
+for arg in "$@"; do
+    case "$arg" in
+        --model|--model=*) HAS_MODEL=1; break ;;
+    esac
+done
+
+if [ "${HAS_MODEL}" = "0" ]; then
+    set -- --model "${DEFAULT_MODEL}" "$@"
+fi
+
 exec env \
     OPENAI_BASE_URL="${OPENAI_BASE_URL:-__LMSTUDIO_URL__}" \
     OPENAI_API_KEY="${OPENAI_API_KEY:-unused}" \
