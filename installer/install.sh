@@ -23,6 +23,7 @@ DO_WRAPPER=1
 DO_SETTINGS=1
 DO_BINARY=1
 DO_BUILD=1
+DO_BOOTSTRAP=1
 WEB_UI_ONLY=0
 GIT_REMOTE="https://github.com/prcdslnc13/claw-code.git"
 DEFAULT_CLONE_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/claw-code"
@@ -62,6 +63,9 @@ Options:
   --no-wrapper           Skip installing the cl wrapper
   --no-settings          Skip dropping ~/.claw/settings.json
   --no-web-ui            Skip Python venv + web-ui setup
+  --no-bootstrap         Don't auto-install missing prerequisites; just check
+                         and exit if any are missing (rust, tmux, python>=3.12,
+                         brew on macOS, system packages on Linux/WSL2)
   --web-ui-only          Skip everything except web-ui bootstrap
                          (used by install.ps1 over WSL2)
   -h, --help             Show this help and exit
@@ -81,6 +85,7 @@ while [ "$#" -gt 0 ]; do
         --no-wrapper)     DO_WRAPPER=0; shift ;;
         --no-settings)    DO_SETTINGS=0; shift ;;
         --no-web-ui)      DO_WEB_UI=0; shift ;;
+        --no-bootstrap)   DO_BOOTSTRAP=0; shift ;;
         --web-ui-only)    WEB_UI_ONLY=1; DO_BINARY=0; DO_BUILD=0; DO_WRAPPER=0; DO_SETTINGS=0; DO_WEB_UI=1; shift ;;
         -h|--help)        print_usage; exit 0 ;;
         *)                error "unknown argument: $1"; print_usage; exit 2 ;;
@@ -88,14 +93,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 # Recompute total step count from enabled phases. Phases:
-#   1 detect, 2 source, 3 prereqs, [4 build], [5 binary], [6 settings],
-#   [7 wrapper], [8 web-ui], 9 verify
+#   1 detect, 2 source, [3 bootstrap], 4 prereqs, [5 build], [6 binary],
+#   [7 settings], [8 wrapper], [9 web-ui], 10 verify
 TOTAL_STEPS=3
-[ "${DO_BUILD}" = "1" ]    && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "${DO_BINARY}" = "1" ]   && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "${DO_SETTINGS}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "${DO_WRAPPER}" = "1" ]  && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "${DO_WEB_UI}" = "1" ]   && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_BOOTSTRAP}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_BUILD}" = "1" ]     && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_BINARY}" = "1" ]    && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_SETTINGS}" = "1" ]  && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_WRAPPER}" = "1" ]   && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "${DO_WEB_UI}" = "1" ]    && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 TOTAL_STEPS=$((TOTAL_STEPS + 1))  # verify
 
 # --- failure trap with hints -------------------------------------------------
@@ -132,6 +138,11 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installer failed (exit ${rc})"; pri
 
 printf '%sclaw installer (fork layer)%s\n' "${C_BOLD}" "${C_RESET}"
 printf '%s  prefix=%s  profile=%s  lmstudio=%s%s\n' "${C_DIM}" "${INSTALL_PREFIX}" "${BUILD_PROFILE}" "${LMSTUDIO_URL}" "${C_RESET}"
+if [ "${DO_BOOTSTRAP}" = "1" ]; then
+    printf '%s  bootstrap=on (will auto-install rust/tmux/python/brew if missing)%s\n' "${C_DIM}" "${C_RESET}"
+else
+    printf '%s  bootstrap=off (will only check; --no-bootstrap given)%s\n' "${C_DIM}" "${C_RESET}"
+fi
 if [ "${WEB_UI_ONLY}" = "1" ]; then
     printf '%s  mode=web-ui-only%s\n' "${C_DIM}" "${C_RESET}"
 fi
@@ -152,8 +163,10 @@ case "${UNAME_S}" in
     Darwin*)        OS_FAMILY="macos" ;;
     MINGW*|MSYS*|CYGWIN*) OS_FAMILY="windows-shell" ;;
 esac
+WSL_TAG=""
+[ "${IS_WSL}" = "1" ] && WSL_TAG=" (wsl)"
 info "uname:     ${UNAME_S} ${UNAME_M}"
-info "os family: ${OS_FAMILY}${IS_WSL:+ (wsl)}"
+info "os family: ${OS_FAMILY}${WSL_TAG}"
 
 case "${OS_FAMILY}" in
     linux|macos) ok "supported platform" ;;
@@ -197,7 +210,204 @@ if [ ! -f "${SOURCE_DIR}/rust/Cargo.toml" ] || [ ! -f "${SOURCE_DIR}/install.sh"
 fi
 ok "source: ${SOURCE_DIR}"
 
-# --- step 3: prereqs --------------------------------------------------------
+# --- step 3: bootstrap missing prerequisites --------------------------------
+#
+# When DO_BOOTSTRAP=1 (default) we proactively install anything missing so
+# this script can be the single command a user runs on a clean machine. The
+# subsequent "Checking prerequisites" step is the verification gate.
+#
+# What we install (gated by what the run actually needs):
+#   - macOS: Xcode CLT (GUI prompt, blocks), Homebrew, rustup, tmux, python@3.12
+#   - Linux/WSL2: distro packages via apt/dnf/pacman (sudo), then rustup
+#   - Native Windows is not handled here — see installer/install.ps1
+#
+# Use --no-bootstrap to skip this step (the prereq check below will still run
+# and bail with hints if anything is missing).
+
+ensure_xcode_clt_macos() {
+    if xcode-select -p >/dev/null 2>&1; then
+        info "Xcode CLT: $(xcode-select -p)"
+        return 0
+    fi
+    warn "Xcode Command Line Tools missing — triggering GUI installer"
+    xcode-select --install >/dev/null 2>&1 || true
+    error "A 'Command Line Tools' install dialog should have appeared. Click"
+    error "Install, wait for it to finish, then re-run this script."
+    exit 1
+}
+
+ensure_brew_macos() {
+    if require_cmd brew; then
+        info "brew: $(brew --version | head -1)"
+        return 0
+    fi
+    info "Homebrew not found — installing via the official script"
+    info "(this will prompt you for your sudo password)"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    if [ -x /opt/homebrew/bin/brew ]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [ -x /usr/local/bin/brew ]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    if ! require_cmd brew; then
+        error "Homebrew install ran but 'brew' still isn't on PATH"
+        exit 1
+    fi
+    ok "installed brew: $(brew --version | head -1)"
+}
+
+ensure_rustup_unix() {
+    if require_cmd cargo && require_cmd rustc; then
+        info "rust: $(rustc --version)"
+        return 0
+    fi
+    info "Rust toolchain not found — installing via rustup-init"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
+    if [ -f "${HOME}/.cargo/env" ]; then
+        # shellcheck disable=SC1091
+        . "${HOME}/.cargo/env"
+    fi
+    if ! require_cmd cargo; then
+        error "rustup ran but 'cargo' still isn't on PATH (try opening a new shell)"
+        exit 1
+    fi
+    ok "installed rust: $(rustc --version)"
+}
+
+ensure_python_312_macos() {
+    if require_cmd python3 && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
+        info "python3: $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        return 0
+    fi
+    info "python3 >= 3.12 not found — brew install python@3.12"
+    brew install python@3.12
+    local brew_py
+    brew_py="$(brew --prefix python@3.12 2>/dev/null)/bin"
+    if [ -d "${brew_py}" ]; then
+        export PATH="${brew_py}:${PATH}"
+    fi
+    if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
+        error "python@3.12 installed but python3 on PATH is still too old"
+        error "PATH=${PATH}"
+        exit 1
+    fi
+    ok "installed python3: $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+}
+
+ensure_tmux_macos() {
+    if require_cmd tmux; then
+        info "tmux: $(tmux -V)"
+        return 0
+    fi
+    info "tmux not found — brew install tmux"
+    brew install tmux
+    if ! require_cmd tmux; then
+        error "tmux install failed"
+        exit 1
+    fi
+    ok "installed tmux: $(tmux -V)"
+}
+
+linux_pkg_install() {
+    # Install one or more system packages via the detected package manager.
+    if require_cmd apt-get; then
+        info "apt-get install: $*"
+        sudo apt-get update -qq
+        sudo apt-get install -y "$@"
+    elif require_cmd dnf; then
+        info "dnf install: $*"
+        sudo dnf install -y "$@"
+    elif require_cmd yum; then
+        info "yum install: $*"
+        sudo yum install -y "$@"
+    elif require_cmd pacman; then
+        info "pacman install: $*"
+        sudo pacman -S --noconfirm --needed "$@"
+    elif require_cmd zypper; then
+        info "zypper install: $*"
+        sudo zypper install -y "$@"
+    else
+        error "No supported package manager (apt/dnf/yum/pacman/zypper) detected."
+        error "Install these yourself: $*"
+        exit 1
+    fi
+}
+
+bootstrap_linux() {
+    # Map abstract needs → distro-specific package names.
+    local need_git=0 need_tmux=0 need_python=0 need_build=0
+    require_cmd git || need_git=1
+    if [ "${DO_WEB_UI}" = "1" ]; then
+        require_cmd tmux || need_tmux=1
+        if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
+            need_python=1
+        fi
+    fi
+    if [ "${DO_BUILD}" = "1" ] && ! require_cmd cargo; then
+        # rustup needs a working compiler + linker toolchain to build the std crates.
+        need_build=1
+    fi
+
+    local pkgs=()
+    if require_cmd apt-get; then
+        [ "${need_git}" = "1" ]    && pkgs+=(git)
+        [ "${need_tmux}" = "1" ]   && pkgs+=(tmux)
+        [ "${need_python}" = "1" ] && pkgs+=(python3 python3-venv python3-pip)
+        [ "${need_build}" = "1" ]  && pkgs+=(build-essential pkg-config libssl-dev curl ca-certificates)
+    elif require_cmd dnf || require_cmd yum; then
+        [ "${need_git}" = "1" ]    && pkgs+=(git)
+        [ "${need_tmux}" = "1" ]   && pkgs+=(tmux)
+        [ "${need_python}" = "1" ] && pkgs+=(python3 python3-virtualenv python3-pip)
+        [ "${need_build}" = "1" ]  && pkgs+=(gcc make pkgconf-pkg-config openssl-devel curl ca-certificates)
+    elif require_cmd pacman; then
+        [ "${need_git}" = "1" ]    && pkgs+=(git)
+        [ "${need_tmux}" = "1" ]   && pkgs+=(tmux)
+        [ "${need_python}" = "1" ] && pkgs+=(python python-virtualenv python-pip)
+        [ "${need_build}" = "1" ]  && pkgs+=(base-devel pkgconf openssl curl ca-certificates)
+    elif require_cmd zypper; then
+        [ "${need_git}" = "1" ]    && pkgs+=(git)
+        [ "${need_tmux}" = "1" ]   && pkgs+=(tmux)
+        [ "${need_python}" = "1" ] && pkgs+=(python3 python3-virtualenv python3-pip)
+        [ "${need_build}" = "1" ]  && pkgs+=(gcc make pkg-config libopenssl-devel curl ca-certificates)
+    fi
+
+    if [ "${#pkgs[@]}" -gt 0 ]; then
+        if [ "${EUID:-$(id -u)}" -ne 0 ] && ! require_cmd sudo; then
+            error "Root or sudo required to install: ${pkgs[*]}"
+            exit 1
+        fi
+        linux_pkg_install "${pkgs[@]}"
+    else
+        info "all distro packages already present"
+    fi
+
+    if [ "${DO_BUILD}" = "1" ]; then
+        ensure_rustup_unix
+    fi
+}
+
+bootstrap_macos() {
+    ensure_xcode_clt_macos
+    ensure_brew_macos
+    if [ "${DO_WEB_UI}" = "1" ]; then
+        ensure_python_312_macos
+        ensure_tmux_macos
+    fi
+    if [ "${DO_BUILD}" = "1" ]; then
+        ensure_rustup_unix
+    fi
+}
+
+if [ "${DO_BOOTSTRAP}" = "1" ]; then
+    step "Bootstrapping missing prerequisites"
+    case "${OS_FAMILY}" in
+        macos) bootstrap_macos ;;
+        linux) bootstrap_linux ;;
+    esac
+    ok "bootstrap complete"
+fi
+
+# --- step 4: prereqs --------------------------------------------------------
 
 step "Checking prerequisites"
 
@@ -209,6 +419,7 @@ if [ "${DO_BUILD}" = "1" ]; then
     else
         error "rust toolchain not found in PATH"
         info "install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+        info "(or rerun this script without --no-bootstrap to install automatically)"
         MISSING=1
     fi
 fi
@@ -237,16 +448,11 @@ if [ "${DO_WEB_UI}" = "1" ]; then
     if require_cmd tmux; then
         ok "tmux: $(tmux -V)"
     else
-        if [ "${OS_FAMILY}" = "macos" ] && require_cmd brew; then
-            warn "tmux not found; running: brew install tmux"
-            brew install tmux
-            ok "tmux: $(tmux -V)"
-        else
-            error "tmux is required for web-ui"
-            info "macOS: brew install tmux"
-            info "Debian/Ubuntu: sudo apt install -y tmux"
-            MISSING=1
-        fi
+        error "tmux is required for web-ui"
+        info "macOS: brew install tmux"
+        info "Debian/Ubuntu: sudo apt install -y tmux"
+        info "(or rerun this script without --no-bootstrap to install automatically)"
+        MISSING=1
     fi
 fi
 

@@ -9,6 +9,11 @@ For the *raw* upstream build (no system install, no settings, no wrapper),
 use the root `./install.sh` directly. This directory is the layer that turns
 that build into a usable workstation install.
 
+**Designed for clean machines.** By default both scripts auto-install missing
+prerequisites (Rust toolchain, tmux, Python ≥ 3.12, Homebrew, distro packages)
+so a fresh box only needs `git` to bootstrap. Pass `--no-bootstrap`
+(`-NoBootstrap` on Windows) to disable that and only check.
+
 ## Quick start
 
 ### macOS / Linux / WSL2
@@ -19,6 +24,16 @@ git clone https://github.com/prcdslnc13/claw-code.git ~/src/claw-code
 cd ~/src/claw-code
 bash installer/install.sh --release --lmstudio-url http://localhost:1234/v1
 ```
+
+On a fresh box this single command will (when something is missing):
+
+- macOS — install Homebrew (prompts for sudo), `tmux`, `python@3.12`, and
+  `rustup` + the stable Rust toolchain. Xcode Command Line Tools must be
+  present; if not, the installer triggers the GUI prompt and asks you to
+  re-run after it finishes.
+- Linux / WSL2 — `sudo apt|dnf|pacman|zypper install` the right system
+  packages (`git`, `tmux`, `python3-venv`, `build-essential`, `libssl-dev`,
+  `pkg-config`), then install `rustup` for your user.
 
 Drops:
 
@@ -38,6 +53,12 @@ git clone https://github.com/prcdslnc13/claw-code.git $env:USERPROFILE\src\claw-
 cd $env:USERPROFILE\src\claw-code
 .\installer\install.ps1 -Release -LmStudioUrl http://localhost:1234/v1
 ```
+
+On a fresh box this will `winget install` Git and `Rustlang.Rustup` if
+they're missing. It does **not** auto-install MSVC build tools or a WSL2
+distro — both are large and may need a reboot. The installer prints the
+exact `winget` / `wsl` commands and exits cleanly so you can run them and
+re-launch.
 
 Drops:
 
@@ -67,6 +88,8 @@ host web-ui because it depends on `tmux`.
 --no-wrapper            Skip installing the cl wrapper
 --no-settings           Skip dropping ~/.claw/settings.json
 --no-web-ui             Skip Python venv + web-ui setup
+--no-bootstrap          Don't auto-install missing prerequisites; just check
+                        and bail with hints if anything is missing
 --web-ui-only           Skip everything except web-ui bootstrap
                         (used by install.ps1 over WSL2)
 -h, --help              Show usage
@@ -83,6 +106,8 @@ host web-ui because it depends on `tmux`.
 -NoWrapper              Skip installing cl.ps1
 -NoSettings             Skip dropping settings.json
 -NoWebUi                Skip WSL2 web-ui bootstrap
+-NoBootstrap            Don't auto-install missing prerequisites via winget;
+                        just check and bail with hints if anything is missing
 -WslDistro NAME         Pin which WSL distro to use (default: first from `wsl -l -q`)
 ```
 
@@ -124,16 +149,31 @@ that user PATH was updated and you need a fresh shell).
 
 ## Prerequisites
 
-The installers will tell you about anything missing and link to the install
-command. In short:
+By default the installers will install all of these automatically (use
+`--no-bootstrap` / `-NoBootstrap` to opt out and only check). The only
+hard prerequisites that must already be present:
 
-- **macOS:** Xcode CLT (`xcode-select --install`), Homebrew (for `tmux`), Rust
-  via `rustup`, Python 3.12+.
-- **Linux / WSL2:** `git`, `tmux`, `python3-venv`, `pkg-config`, `libssl-dev`,
-  `build-essential`, Rust via `rustup`.
-- **Windows 11:** `git` (via winget), Rust via `rustup` (winget), MSVC build
-  tools (Visual Studio 2022 BuildTools with the "Desktop development with
-  C++" workload), and a WSL2 distro if you want web-ui.
+- **macOS:** Xcode Command Line Tools. The installer triggers the GUI
+  prompt and exits cleanly if they're missing — accept the dialog, wait
+  for the install, then re-run.
+- **Linux / WSL2:** ability to `sudo` the system package manager
+  (apt-get, dnf, yum, pacman, or zypper) — the installer asks for your
+  password.
+- **Windows 11:** `winget` (ships with App Installer, available from the
+  Microsoft Store), and PowerShell 5.1 or later.
+
+Everything else (Homebrew, `tmux`, `python@3.12`, the Rust toolchain, the
+distro packages `build-essential`/`pkg-config`/`libssl-dev`/`python3-venv`,
+and `git` on Windows) gets installed for you on first run.
+
+Two pieces remain manual on Windows because they're large and may require
+a reboot:
+
+- **MSVC build tools** — `winget install Microsoft.VisualStudio.2022.BuildTools`
+  with the "Desktop development with C++" workload.
+- **A WSL2 distro for web-ui** — `wsl --install -d Ubuntu`.
+
+The installer prints the exact commands when these are missing.
 
 ## Out of scope
 

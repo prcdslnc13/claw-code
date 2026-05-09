@@ -27,7 +27,8 @@ param(
     [switch]$NoBinary,
     [switch]$NoWrapper,
     [switch]$NoSettings,
-    [switch]$NoWebUi
+    [switch]$NoWebUi,
+    [switch]$NoBootstrap
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,10 +61,11 @@ if ($Debug)   { $BuildProfile = 'debug' }
 if ($Release) { $BuildProfile = 'release' }
 
 # --- step count -------------------------------------------------------------
-# 1 detect, 2 prereqs, 3 source, [4 build], [5 binary], [6 settings],
-# [7 wrapper], [8 web-ui], 9 verify
+# 1 detect, [2 bootstrap], 3 prereqs, 4 source, [5 build], [6 binary],
+# [7 settings], [8 wrapper], [9 web-ui], 10 verify
 
 $script:TotalSteps = 3
+if (-not $NoBootstrap){ $script:TotalSteps += 1 }
 if (-not $NoBinary)   { $script:TotalSteps += 2 }   # build + install binary
 if (-not $NoSettings) { $script:TotalSteps += 1 }
 if (-not $NoWrapper)  { $script:TotalSteps += 1 }
@@ -74,6 +76,11 @@ $script:TotalSteps += 1                              # verify
 
 Write-Host "claw installer (fork layer, Windows)" -ForegroundColor White
 Write-Host ("  prefix={0}  profile={1}  lmstudio={2}" -f $Prefix, $BuildProfile, $LmStudioUrl) -ForegroundColor DarkGray
+if ($NoBootstrap) {
+    Write-Host "  bootstrap=off (will only check; -NoBootstrap given)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  bootstrap=on (winget-installs missing git/rust if found; warns for VS BuildTools/WSL2)" -ForegroundColor DarkGray
+}
 
 # --- step 1: detect environment --------------------------------------------
 
@@ -88,6 +95,87 @@ if (-not $os.Caption.Contains('Windows 11') -and -not $os.Caption.Contains('Wind
     Write-Warn "This installer targets Windows 10/11; you may run into issues."
 }
 Write-OK "platform detected"
+
+# --- step 1.5: bootstrap missing prerequisites -----------------------------
+#
+# When -NoBootstrap is NOT passed (the default), proactively install whatever
+# we can install non-interactively via winget so the script can be the single
+# command a user runs on a clean Windows 11 box.
+#
+# What we attempt:
+#   - git           winget install --id Git.Git
+#   - rust          winget install --id Rustlang.Rustup (only if -NoBinary not set)
+# What we cannot fully automate (still surfaced as instructions):
+#   - MSVC build tools (multi-GB, may need a reboot, large UI flow)
+#   - WSL2 distro install (`wsl --install -d Ubuntu` requires a reboot to finish)
+
+function Invoke-Winget {
+    param([Parameter(Mandatory)][string]$Id, [string]$Source = 'winget')
+    & winget install --exact --id $Id --source $Source `
+        --accept-source-agreements --accept-package-agreements `
+        --silent
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget install $Id failed (exit $LASTEXITCODE)"
+    }
+}
+
+function Reload-PathFromRegistry {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = ($machine, $user) -join ';'
+}
+
+if (-not $NoBootstrap) {
+    Write-Step "Bootstrapping missing prerequisites"
+
+    if (-not (Test-Cmd 'winget')) {
+        Write-Warn "winget not on PATH — cannot auto-install dependencies."
+        Write-Info "Install winget via the Microsoft Store ('App Installer'), then re-run."
+        Write-Info "Or pass -NoBootstrap and install git/rust/MSVC manually."
+    } else {
+        Write-Info ("winget: {0}" -f ((winget --version) 2>$null))
+
+        if (-not (Test-Cmd 'git')) {
+            Write-Info "git missing — winget install Git.Git"
+            try { Invoke-Winget -Id 'Git.Git' } catch { Write-Err $_.Exception.Message; exit 1 }
+            Reload-PathFromRegistry
+        } else {
+            Write-Info ("git: {0}" -f ((git --version) 2>$null))
+        }
+
+        if (-not $NoBinary) {
+            if (-not ((Test-Cmd 'cargo') -and (Test-Cmd 'rustc'))) {
+                Write-Info "rust missing — winget install Rustlang.Rustup"
+                try { Invoke-Winget -Id 'Rustlang.Rustup' } catch { Write-Err $_.Exception.Message; exit 1 }
+                Reload-PathFromRegistry
+                # rustup-init drops cargo into ~/.cargo/bin; ensure that's on $env:Path for this session
+                $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+                if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) {
+                    $env:Path = "$cargoBin;$env:Path"
+                }
+            } else {
+                Write-Info ("rust: {0}" -f ((rustc --version) 2>$null))
+            }
+
+            if (-not (Test-Cmd 'link.exe')) {
+                Write-Warn "MSVC linker not on PATH. Cargo will fail without 'Desktop development with C++'"
+                Write-Warn "build tools. This installer does NOT auto-install them — they're large"
+                Write-Warn "and may require a reboot. Install with:"
+                Write-Info  "  winget install --id Microsoft.VisualStudio.2022.BuildTools -e --source winget"
+                Write-Info  "    --override `"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`""
+                Write-Info  "Then close and re-open PowerShell, and re-run this script."
+            }
+        }
+
+        if (-not $NoWebUi -and -not (Test-Cmd 'wsl')) {
+            Write-Warn "wsl not found. Web-UI needs WSL2. Install with:"
+            Write-Info  "  wsl --install -d Ubuntu"
+            Write-Info  "Then reboot and re-run this script. (Or pass -NoWebUi to skip web-ui.)"
+        }
+    }
+
+    Write-OK "bootstrap complete"
+}
 
 # --- step 2: prereqs --------------------------------------------------------
 
