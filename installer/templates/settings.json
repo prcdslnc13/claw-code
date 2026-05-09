@@ -1,0 +1,8 @@
+{
+  "model": "__DEFAULT_MODEL__",
+  "permissions": {
+    "defaultMode": "default",
+    "deny": ["bash(curl:*)", "bash(wget:*)", "bash(sudo:*)", "bash(rm:*)"],
+    "ask": ["bash"]
+  }
+}
