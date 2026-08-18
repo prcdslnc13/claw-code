@@ -565,9 +565,23 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        // Trigger on the *current* context size, not the cumulative input
+        // counter: cumulative only ever grows, so once crossed it would
+        // compact after every subsequent turn no matter how small the live
+        // context had become. The prompt side of the most recent model call
+        // (input + cache creation + cache read, covering cached and uncached
+        // providers alike) is the actual context size; when the provider
+        // reported no usage at all, fall back to the local estimate.
+        let latest = self.usage_tracker.current_turn_usage();
+        let prompt_tokens = u64::from(latest.input_tokens)
+            + u64::from(latest.cache_creation_input_tokens)
+            + u64::from(latest.cache_read_input_tokens);
+        let current_context_tokens = if prompt_tokens > 0 {
+            prompt_tokens
+        } else {
+            estimate_session_tokens(&self.session) as u64
+        };
+        if current_context_tokens < u64::from(self.auto_compaction_input_tokens_threshold) {
             return None;
         }
 
@@ -1525,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_context_size_crosses_threshold() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1577,6 +1591,66 @@ mod tests {
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    /// Regression: the trigger must compare the *latest* request's context
+    /// size, not the cumulative input counter. Cumulative only grows, so
+    /// under the old check two modest turns (60k each) crossed a 100k
+    /// threshold and compaction fired on every turn thereafter.
+    #[test]
+    fn cumulative_usage_across_turns_does_not_trigger_auto_compaction() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 60_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        for turn in 0..3 {
+            let summary = runtime
+                .run_turn(format!("turn {turn}"), None)
+                .expect("turn should succeed");
+            assert_eq!(
+                summary.auto_compaction, None,
+                "turn {turn}: 60k-token context must not compact under a 100k \
+                 threshold, regardless of cumulative usage"
+            );
+        }
+        assert!(runtime.usage().cumulative_usage().input_tokens > 100_000);
+        assert_ne!(runtime.session().messages[0].role, MessageRole::System);
     }
 
     #[test]
