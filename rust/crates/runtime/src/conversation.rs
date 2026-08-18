@@ -204,6 +204,14 @@ where
         self
     }
 
+    /// Adjust the auto-compaction threshold on a live runtime. The
+    /// builder above only works at construction; embedders that expose
+    /// runtime-tunable session options (cherryd's `/options
+    /// context_limit_tokens`) need to change it between turns.
+    pub fn set_auto_compaction_input_tokens_threshold(&mut self, threshold: u32) {
+        self.auto_compaction_input_tokens_threshold = threshold;
+    }
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
@@ -1606,6 +1614,21 @@ mod tests {
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
+    fn auto_compaction_threshold_is_settable_on_a_live_runtime() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+        assert_eq!(runtime.auto_compaction_input_tokens_threshold, 100_000);
+        runtime.set_auto_compaction_input_tokens_threshold(50_000);
+        assert_eq!(runtime.auto_compaction_input_tokens_threshold, 50_000);
     }
 
     #[test]
