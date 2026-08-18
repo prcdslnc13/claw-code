@@ -31,6 +31,17 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// llama.cpp-native sampling extensions (`top_k`, `min_p`,
+    /// `repeat_penalty`). Not part of the OpenAI spec — llama-server
+    /// honours them, other OpenAI-compatible backends ignore the unknown
+    /// fields. Omitted from the payload when `None`, so backends that
+    /// reject extras never see them unless explicitly set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
 }
 
 impl MessageRequest {

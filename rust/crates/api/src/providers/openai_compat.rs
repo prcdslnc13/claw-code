@@ -983,6 +983,17 @@ pub fn build_chat_completion_request(
         if let Some(presence_penalty) = request.presence_penalty {
             payload["presence_penalty"] = json!(presence_penalty);
         }
+        // llama.cpp-native extensions — only ever present when explicitly
+        // set, so spec-strict backends never see unknown fields by default.
+        if let Some(top_k) = request.top_k {
+            payload["top_k"] = json!(top_k);
+        }
+        if let Some(min_p) = request.min_p {
+            payload["min_p"] = json!(min_p);
+        }
+        if let Some(repeat_penalty) = request.repeat_penalty {
+            payload["repeat_penalty"] = json!(repeat_penalty);
+        }
     }
     // stop is generally safe for all providers
     if let Some(stop) = &request.stop {
@@ -1950,6 +1961,9 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            top_k: Some(40),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.1),
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -1957,6 +1971,9 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+        assert_eq!(payload["top_k"], 40);
+        assert_eq!(payload["min_p"], 0.05);
+        assert_eq!(payload["repeat_penalty"], 1.1);
     }
 
     #[test]
