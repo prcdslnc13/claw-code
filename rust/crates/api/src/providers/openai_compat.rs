@@ -36,6 +36,16 @@ pub struct OpenAiCompatConfig {
     /// - `OpenAI`: 100MB (`104_857_600` bytes)
     /// - `xAI`: 50MB (`52_428_800` bytes)
     pub max_request_body_bytes: usize,
+    /// Whether to strip an OpenRouter-style routing prefix from the model
+    /// id before it goes on the wire (`openai/gpt-4` → `gpt-4`).
+    ///
+    /// True for the hosted providers, where the prefix is routing metadata
+    /// the upstream does not want. **Local backends must set this false:**
+    /// there the vendor namespace is part of the identifier, not a routing
+    /// hint. LM Studio serves `qwen/qwen3.8-27b` and rejects the stripped
+    /// `qwen3.8-27b` outright, so stripping turns every `qwen/*`,
+    /// `openai/*` and `kimi/*` model into a 400.
+    pub strip_routing_prefix: bool,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -56,6 +66,7 @@ impl OpenAiCompatConfig {
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
             max_request_body_bytes: XAI_MAX_REQUEST_BODY_BYTES,
+            strip_routing_prefix: true,
         }
     }
 
@@ -67,6 +78,7 @@ impl OpenAiCompatConfig {
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
             max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+            strip_routing_prefix: true,
         }
     }
 
@@ -82,6 +94,7 @@ impl OpenAiCompatConfig {
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
             max_request_body_bytes: DASHSCOPE_MAX_REQUEST_BODY_BYTES,
+            strip_routing_prefix: true,
         }
     }
 
@@ -926,7 +939,12 @@ pub fn build_chat_completion_request(
         }));
     }
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(&request.model);
+    // Opt-out for local backends, where the namespace is part of the id.
+    let wire_model = if config.strip_routing_prefix {
+        strip_routing_prefix(&request.model)
+    } else {
+        request.model.as_str()
+    };
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
@@ -2527,5 +2545,31 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    #[test]
+    fn routing_prefix_opt_out_keeps_local_model_ids_intact() {
+        // LM Studio's ids carry the vendor namespace: `qwen/qwen3.8-27b`
+        // IS the identifier, and the stripped form is rejected with a 400.
+        let request = MessageRequest {
+            model: "qwen/qwen3.8-27b".to_string(),
+            max_tokens: 16,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let mut local = OpenAiCompatConfig::openai();
+        local.strip_routing_prefix = false;
+        let payload = build_chat_completion_request(&request, local);
+        assert_eq!(payload["model"], "qwen/qwen3.8-27b");
+
+        // Hosted providers keep the old behavior.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["model"], "qwen3.8-27b");
     }
 }
