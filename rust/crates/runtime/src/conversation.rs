@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -140,6 +141,15 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    /// Armed when the context is compacted, disarmed by the probe that
+    /// consumes it. `session.compaction` cannot serve this role: it is
+    /// sticky (set once in `record_compaction`, persisted, restored on
+    /// load), so gating on it re-probes on every later turn forever.
+    health_probe_pending: bool,
+    /// Directory the post-compaction canary globs. `None` falls back to
+    /// the process cwd, which for a daemon embedder is whatever it was
+    /// launched with — see `with_health_probe_root`.
+    health_probe_root: Option<PathBuf>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -176,6 +186,9 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        // A session rehydrated from disk that carries compaction metadata
+        // has not been probed in this process yet, so arm it once.
+        let health_probe_pending = session.compaction.is_some();
         Self {
             session,
             api_client,
@@ -189,7 +202,18 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            health_probe_pending,
+            health_probe_root: None,
         }
+    }
+
+    /// Bound the post-compaction health canary to a specific directory.
+    /// Without this the probe globs the process cwd; a daemon embedder
+    /// whose cwd is `$HOME` (or `/`) would walk the entire tree.
+    #[must_use]
+    pub fn with_health_probe_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.health_probe_root = Some(root.into());
+        self
     }
 
     #[must_use]
@@ -313,10 +337,18 @@ where
             return Ok(());
         }
 
-        // Verify tool executor is responsive with a non-destructive probe
-        // Using glob_search with a pattern that won't match anything
-        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
-        match self.tool_executor.execute("glob_search", probe_input) {
+        // Verify tool executor is responsive with a non-destructive probe.
+        // The pattern is chosen never to match; the point is that dispatch
+        // returns, not what it finds. Scope the walk to the configured root
+        // so an embedder with a wide cwd doesn't traverse the whole disk.
+        let probe_input = match self.health_probe_root.as_ref() {
+            Some(root) => format!(
+                r#"{{"pattern": "*.health-check-probe-", "path": {}}}"#,
+                Value::String(root.to_string_lossy().into_owned())
+            ),
+            None => r#"{"pattern": "*.health-check-probe-"}"#.to_owned(),
+        };
+        match self.tool_executor.execute("glob_search", &probe_input) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("Tool executor probe failed: {e}")),
         }
@@ -330,8 +362,11 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
-        // ROADMAP #38: Session-health canary - probe if context was compacted
-        if self.session.compaction.is_some() {
+        // ROADMAP #38: Session-health canary - probe once per compaction.
+        // Gating on `session.compaction.is_some()` fired on every turn for
+        // the rest of the session's life, because that field is never
+        // cleared once set.
+        if std::mem::take(&mut self.health_probe_pending) {
             if let Err(error) = self.run_session_health_probe() {
                 return Err(RuntimeError::new(format!(
                     "Session health probe failed after compaction: {error}. \
@@ -598,6 +633,7 @@ where
         }
 
         self.session = result.compacted_session;
+        self.health_probe_pending = true;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -874,7 +910,8 @@ mod tests {
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -1959,5 +1996,118 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    /// The canary is meant to fire once after a compaction. It used to be
+    /// gated on `session.compaction.is_some()`, which is sticky — set by
+    /// `record_compaction`, never cleared, and restored from the persisted
+    /// session — so every turn for the rest of the session's life paid for
+    /// a filesystem walk.
+    #[test]
+    fn health_probe_runs_once_per_compaction_not_every_turn() {
+        struct QuietApi;
+
+        impl ApiClient for QuietApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // given a session that has already been compacted
+        let mut session = Session::new();
+        session
+            .push_user_text("earlier turn")
+            .expect("seed message accepted");
+        session.record_compaction("summary", 1);
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&probes);
+        let executor = StaticToolExecutor::new().register("glob_search", move |_input: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok("{\"filenames\":[]}".to_string())
+        });
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            QuietApi,
+            executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        // when three turns run
+        for _ in 0..3 {
+            runtime.run_turn("hello", None).expect("turn succeeds");
+        }
+
+        // then the canary fired only on the first
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "probe should be consumed by the first turn after compaction"
+        );
+    }
+
+    /// A configured root must reach `glob_search` as an explicit `path`,
+    /// so the walk is bounded instead of defaulting to the process cwd.
+    #[test]
+    fn health_probe_scopes_the_walk_to_the_configured_root() {
+        struct QuietApi;
+
+        impl ApiClient for QuietApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // given
+        let mut session = Session::new();
+        session
+            .push_user_text("earlier turn")
+            .expect("seed message accepted");
+        session.record_compaction("summary", 1);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let executor = StaticToolExecutor::new().register("glob_search", move |input: &str| {
+            recorder
+                .lock()
+                .expect("probe input recorded")
+                .push(input.to_string());
+            Ok("{\"filenames\":[]}".to_string())
+        });
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            QuietApi,
+            executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_health_probe_root("/home/someone/project");
+
+        // when
+        runtime.run_turn("hello", None).expect("turn succeeds");
+
+        // then
+        let recorded = seen.lock().expect("probe input readable");
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].contains(r#""path": "/home/someone/project""#),
+            "probe should carry an explicit path, got: {}",
+            recorded[0]
+        );
     }
 }
