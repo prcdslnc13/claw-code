@@ -285,20 +285,24 @@ fn prepare_tokio_command(
         prepare_sandbox_dirs(cwd);
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+            let mut cmd = TokioCommand::new(launcher.program);
+            cmd.args(launcher.args);
+            cmd.envs(launcher.env);
+            cmd
+        } else {
+            let mut cmd = TokioCommand::new("sh");
+            cmd.arg("-lc").arg(command);
+            if sandbox_status.filesystem_active {
+                cmd.env("HOME", cwd.join(".sandbox-home"));
+                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            cmd
+        };
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-    }
+    prepared.current_dir(cwd);
+    prepared.stdin(Stdio::null());
     prepared
 }
 

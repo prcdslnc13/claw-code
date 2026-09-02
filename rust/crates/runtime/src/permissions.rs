@@ -360,7 +360,8 @@ impl PermissionRule {
                     let matcher = parse_rule_matcher(content);
                     return Self {
                         raw: trimmed.to_string(),
-                        tool_name: tool_name.to_string(),
+                        // #94: normalize tool name to lowercase to match runtime convention
+                        tool_name: tool_name.to_lowercase(),
                         matcher,
                     };
                 }
@@ -369,13 +370,17 @@ impl PermissionRule {
 
         Self {
             raw: trimmed.to_string(),
-            tool_name: trimmed.to_string(),
+            // #94: normalize tool name to lowercase to match runtime convention
+            tool_name: trimmed.to_lowercase(),
             matcher: PermissionRuleMatcher::Any,
         }
     }
 
     fn matches(&self, tool_name: &str, input: &str) -> bool {
-        if self.tool_name != tool_name {
+        // Rule names are lowercased at parse time (#94); runtime tool names
+        // are not all lowercase (`WebFetch`, `WebSearch`), so compare
+        // case-insensitively or those rules can never match.
+        if !self.tool_name.eq_ignore_ascii_case(tool_name) {
             return false;
         }
 

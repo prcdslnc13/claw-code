@@ -511,10 +511,12 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // Handle reasoning/thinking from various provider fields
             if let Some(reasoning) = choice
                 .delta
                 .reasoning_content
                 .filter(|value| !value.is_empty())
+                .or(choice.delta.thinking.and_then(|t| t.content).filter(|value| !value.is_empty()))
             {
                 if !self.thinking_started {
                     self.thinking_started = true;
@@ -742,6 +744,7 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     id: String,
     model: String,
     choices: Vec<ChatChoice>,
@@ -789,6 +792,7 @@ struct OpenAiUsage {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     model: Option<String>,
@@ -800,6 +804,7 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    #[serde(default)]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -809,10 +814,19 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1381,7 +1395,48 @@ fn parse_sse_frame(
             data_lines.push(data.trim_start());
         }
     }
+    // If no SSE data lines found, check if the entire frame is raw JSON (error or otherwise)
     if data_lines.is_empty() {
+        // Detect raw JSON error response (not SSE-framed)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|c| c as u16);
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(500))
+                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(ApiError::Api {
+                    status,
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id: None,
+                    body: trimmed.chars().take(500).collect(),
+                    retryable: false,
+                    suggested_action: suggested_action_for_status(status),
+                });
+            }
+        }
+        // Detect HTML responses
+        if trimmed.starts_with('<') || trimmed.starts_with("<!") {
+            return Err(ApiError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                error_type: Some("invalid_response".to_string()),
+                message: Some("provider returned HTML instead of JSON (check endpoint URL)".to_string()),
+                request_id: None,
+                body: trimmed.chars().take(200).collect(),
+                retryable: false,
+                suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            });
+        }
         return Ok(None);
     }
     let payload = data_lines.join("\n");
@@ -1417,6 +1472,19 @@ fn parse_sse_frame(
                 suggested_action: suggested_action_for_status(status),
             });
         }
+    }
+    // Detect HTML or other non-JSON responses early for better error messages
+    let trimmed_payload = payload.trim();
+    if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
+        return Err(ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_response".to_string()),
+            message: Some("provider returned HTML instead of JSON (check endpoint URL)".to_string()),
+            request_id: None,
+            body: payload.chars().take(200).collect(),
+            retryable: false,
+            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+        });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
@@ -1470,7 +1538,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
 
     let suggested_action = suggested_action_for_status(status);
 
@@ -1491,6 +1559,21 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
 }
 
 /// Generate a suggested user action based on the HTTP status code and error context.
@@ -1703,6 +1786,7 @@ mod tests {
                     delta: super::ChunkDelta {
                         content: None,
                         reasoning_content: Some("think".to_string()),
+                        thinking: None,
                         tool_calls: Vec::new(),
                     },
                     finish_reason: None,
@@ -1719,6 +1803,7 @@ mod tests {
                         delta: super::ChunkDelta {
                             content: Some(" answer".to_string()),
                             reasoning_content: None,
+                            thinking: None,
                             tool_calls: Vec::new(),
                         },
                         finish_reason: Some("stop".to_string()),
