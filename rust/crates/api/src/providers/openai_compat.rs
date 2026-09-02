@@ -1038,7 +1038,34 @@ pub fn build_chat_completion_request(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    // Caller-supplied escape hatch, applied last so it wins over the typed
+    // tuning fields above (documented on `MessageRequest::extra_body`). Core
+    // protocol keys stay protected so a stray entry cannot corrupt the
+    // request shape.
+    if let Some(extra_body) = &request.extra_body {
+        for (key, value) in extra_body {
+            if is_protected_extra_body_key(key) {
+                continue;
+            }
+            payload[key] = value.clone();
+        }
+    }
+
     payload
+}
+
+fn is_protected_extra_body_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "stream"
+            | "stream_options"
+            | "tools"
+            | "tool_choice"
+            | "max_tokens"
+            | "max_completion_tokens"
+    )
 }
 
 /// Returns true for models that do NOT support the `is_error` field in tool results.
@@ -1627,7 +1654,7 @@ mod tests {
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
         ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -2067,6 +2094,7 @@ mod tests {
             top_k: Some(40),
             min_p: Some(0.05),
             repeat_penalty: Some(1.1),
+            extra_body: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -2077,6 +2105,148 @@ mod tests {
         assert_eq!(payload["top_k"], 40);
         assert_eq!(payload["min_p"], 0.05);
         assert_eq!(payload["repeat_penalty"], 1.1);
+    }
+
+    fn extra_body_map(entries: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn extra_body_keys_are_merged_into_payload() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("hello")],
+            extra_body: Some(extra_body_map(&[
+                (
+                    "web_search_options",
+                    json!({"search_context_size": "medium"}),
+                ),
+                ("parallel_tool_calls", json!(false)),
+                ("n_probs", json!(4)),
+            ])),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["web_search_options"],
+            json!({"search_context_size": "medium"})
+        );
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
+        assert_eq!(payload["n_probs"], json!(4));
+        // The field itself never leaks onto the wire as a nested object.
+        assert!(payload.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn extra_body_is_absent_by_default() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        let keys = payload.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys, vec!["max_tokens", "messages", "model", "stream"]);
+    }
+
+    #[test]
+    fn extra_body_cannot_override_protected_protocol_keys() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("hello")],
+            stream: true,
+            extra_body: Some(extra_body_map(&[
+                ("model", json!("bad-override")),
+                ("messages", json!([])),
+                ("max_tokens", json!(1)),
+                ("max_completion_tokens", json!(1)),
+                ("stream", json!(false)),
+                ("stream_options", json!({"include_usage": false})),
+                ("tools", json!([{"bogus": true}])),
+                ("tool_choice", json!("none")),
+            ])),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["max_tokens"], json!(1024));
+        assert!(payload.get("max_completion_tokens").is_none());
+        assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["stream"], json!(true));
+        assert_eq!(payload["stream_options"], json!({"include_usage": true}));
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn extra_body_wins_over_typed_sampling_fields_on_conflict() {
+        // Documented precedence: extra_body is the explicit escape hatch and is
+        // applied after the typed fields, so it overrides them. Typed fields
+        // that are not mentioned in extra_body are untouched.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("hello")],
+            temperature: Some(0.7),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.1),
+            extra_body: Some(extra_body_map(&[
+                ("temperature", json!(0.1)),
+                ("top_k", json!(20)),
+            ])),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["temperature"], json!(0.1));
+        assert_eq!(payload["top_k"], json!(20));
+        assert_eq!(payload["min_p"], json!(0.05));
+        assert_eq!(payload["repeat_penalty"], json!(1.1));
+    }
+
+    #[test]
+    fn extra_body_survives_reasoning_model_tuning_strip() {
+        // The typed tuning fields are stripped for reasoning models; extra_body
+        // is the deliberate way to force one through anyway.
+        let request = MessageRequest {
+            model: "o1-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("hello")],
+            temperature: Some(0.7),
+            extra_body: Some(extra_body_map(&[("temperature", json!(1.0))])),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["temperature"], json!(1.0));
+    }
+
+    #[test]
+    fn extra_body_round_trips_through_serde() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 8,
+            messages: vec![],
+            extra_body: Some(extra_body_map(&[("n_probs", json!(4))])),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(encoded["extra_body"], json!({"n_probs": 4}));
+        let decoded: MessageRequest = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, request);
+
+        // Absent on the wire when None, and tolerated when missing on input.
+        let bare = serde_json::to_value(MessageRequest::default()).expect("serialize");
+        assert!(bare.get("extra_body").is_none());
+        let decoded: MessageRequest = serde_json::from_value(bare).expect("deserialize");
+        assert_eq!(decoded.extra_body, None);
     }
 
     #[test]

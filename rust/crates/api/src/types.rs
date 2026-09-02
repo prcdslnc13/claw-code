@@ -42,6 +42,20 @@ pub struct MessageRequest {
     pub min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
+    /// Provider-specific OpenAI-compatible request body parameters (mirrors
+    /// upstream's `extra_body`). Merged into the outgoing JSON *after* every
+    /// typed field above, so callers can opt into gateway or local-server
+    /// switches (`web_search_options`, `parallel_tool_calls`, `n_probs`, …)
+    /// without waiting for a first-class field.
+    ///
+    /// Precedence: core protocol keys (`model`, `messages`, `stream`,
+    /// `stream_options`, `tools`, `tool_choice`, `max_tokens`,
+    /// `max_completion_tokens`) are protected and ignored here. Any other key
+    /// — including the typed sampling fields such as `temperature` or `top_k`
+    /// — is overwritten by `extra_body` when both are set, because this map is
+    /// the explicit escape hatch and is only populated on request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Map<String, Value>>,
 }
 
 impl MessageRequest {

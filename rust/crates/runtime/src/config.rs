@@ -93,9 +93,27 @@ pub struct RuntimePermissionRuleConfig {
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
+///
+/// Entries that fail to parse are recorded in `invalid_servers` instead of
+/// failing the whole config load, so one malformed `mcpServers` entry never
+/// hides the servers that are fine (upstream 4619375).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
+    invalid_servers: Vec<McpInvalidServerConfig>,
+    total_configured: usize,
+}
+
+/// An `mcpServers` entry that was present in a settings file but could not be
+/// parsed. Kept alongside the valid servers so callers can report it without
+/// the load having failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpInvalidServerConfig {
+    pub name: String,
+    pub scope: ConfigSource,
+    pub path: PathBuf,
+    pub error_field: String,
+    pub reason: String,
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -271,7 +289,7 @@ impl ConfigLoader {
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
-        let mut mcp_servers = BTreeMap::new();
+        let mut mcp = McpConfigCollection::default();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
@@ -290,7 +308,7 @@ impl ConfigLoader {
             }
             all_warnings.extend(validation.warnings);
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
@@ -304,9 +322,7 @@ impl ConfigLoader {
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
             plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
+            mcp,
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             aliases: parse_optional_aliases(&merged_value)?,
@@ -638,6 +654,34 @@ impl McpConfigCollection {
         &self.servers
     }
 
+    /// Entries that were configured but could not be parsed. Never fatal.
+    #[must_use]
+    pub fn invalid_servers(&self) -> &[McpInvalidServerConfig] {
+        &self.invalid_servers
+    }
+
+    /// Number of `mcpServers` entries seen across all scopes, valid or not.
+    /// Redefinitions across scopes count once per file.
+    #[must_use]
+    pub fn total_configured(&self) -> usize {
+        self.total_configured
+    }
+
+    #[must_use]
+    pub fn valid_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    #[must_use]
+    pub fn invalid_count(&self) -> usize {
+        self.invalid_servers.len()
+    }
+
+    #[must_use]
+    pub fn has_invalid_servers(&self) -> bool {
+        !self.invalid_servers.is_empty()
+    }
+
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScopedMcpServerConfig> {
         self.servers.get(name)
@@ -707,7 +751,7 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 }
 
 fn merge_mcp_servers(
-    target: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    target: &mut McpConfigCollection,
     source: ConfigSource,
     root: &BTreeMap<String, JsonValue>,
     path: &Path,
@@ -715,22 +759,83 @@ fn merge_mcp_servers(
     let Some(mcp_servers) = root.get("mcpServers") else {
         return Ok(());
     };
+    // A non-object `mcpServers` value is still fatal: there is nothing to
+    // salvage. Individual entries are best-effort below.
     let servers = expect_object(mcp_servers, &format!("{}: mcpServers", path.display()))?;
+    target.total_configured += servers.len();
     for (name, value) in servers {
-        let parsed = parse_mcp_server_config(
-            name,
-            value,
-            &format!("{}: mcpServers.{name}", path.display()),
-        )?;
-        target.insert(
-            name.clone(),
-            ScopedMcpServerConfig {
-                scope: source,
-                config: parsed,
-            },
-        );
+        let context = format!("{}: mcpServers.{name}", path.display());
+        match parse_mcp_server_config(name, value, &context) {
+            Ok(parsed) => {
+                target.servers.insert(
+                    name.clone(),
+                    ScopedMcpServerConfig {
+                        scope: source,
+                        config: parsed,
+                    },
+                );
+            }
+            Err(error) => {
+                // A broken redefinition in a higher-precedence scope shadows
+                // the lower-scope entry rather than silently keeping it.
+                target.servers.remove(name);
+                target
+                    .invalid_servers
+                    .push(mcp_invalid_server(name, source, path, &context, &error));
+            }
+        }
     }
     Ok(())
+}
+
+fn mcp_invalid_server(
+    name: &str,
+    source: ConfigSource,
+    path: &Path,
+    context: &str,
+    error: &ConfigError,
+) -> McpInvalidServerConfig {
+    let reason = match error {
+        ConfigError::Io(error) => error.to_string(),
+        ConfigError::Parse(reason) => reason.clone(),
+    };
+    McpInvalidServerConfig {
+        name: name.to_string(),
+        scope: source,
+        path: path.to_path_buf(),
+        error_field: mcp_error_field(name, context, &reason),
+        reason,
+    }
+}
+
+/// Best-effort extraction of the offending field name from a parse error
+/// message, for display. Falls back to `mcpServers.<name>`.
+fn mcp_error_field(name: &str, context: &str, reason: &str) -> String {
+    let trim = |field: &str| {
+        field
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .to_string()
+    };
+    if let Some(field) = reason
+        .split("missing string field ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+    {
+        return trim(field);
+    }
+    if let Some(field) = reason
+        .split("field ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+    {
+        return trim(field);
+    }
+    reason
+        .split_once(context)
+        .and_then(|(_, tail)| tail.trim_start_matches('.').split(':').next())
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("mcpServers.{name}"))
 }
 
 fn parse_optional_model(root: &JsonValue) -> Option<String> {
@@ -950,6 +1055,49 @@ fn parse_optional_oauth_config(
     }))
 }
 
+/// Expand `${VAR}` environment references and a leading `~` in an MCP config
+/// string (upstream 7c4bcd9, #92). Semantics, kept identical to upstream:
+///
+/// - `${VAR}` is replaced by the variable's value, or by nothing if unset.
+/// - Bare `$VAR` and `$$` are passed through untouched — only the braced form
+///   expands.
+/// - `~` expands to `$HOME` only when nothing has been emitted yet (i.e. at
+///   the very start of the value); a `~` anywhere else is literal. If `HOME`
+///   is unset the `~` is kept.
+/// - An unterminated `${` consumes the rest of the value as the variable name.
+fn expand_config_value(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if chars.peek() == Some(&'{') {
+                chars.next(); // consume '{'
+                let mut var_name = String::new();
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        break;
+                    }
+                    var_name.push(ch);
+                }
+                if let Ok(val) = std::env::var(&var_name) {
+                    result.push_str(&val);
+                }
+            } else {
+                result.push(c);
+            }
+        } else if c == '~' && result.is_empty() {
+            if let Ok(home) = std::env::var("HOME") {
+                result.push_str(&home);
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn parse_mcp_server_config(
     server_name: &str,
     value: &JsonValue,
@@ -959,10 +1107,22 @@ fn parse_mcp_server_config(
     let server_type =
         optional_string(object, "type", context)?.unwrap_or_else(|| infer_mcp_server_type(object));
     match server_type {
+        // `${VAR}` / `~` expansion applies to command, args, env values and
+        // urls. Env *values* go one step beyond upstream 7c4bcd9 (which only
+        // did command/args/url) because `${HOME}/…` in an env value is the
+        // same "silently passed verbatim" trap; env *keys* are left alone.
         "stdio" => Ok(McpServerConfig::Stdio(McpStdioServerConfig {
-            command: expect_string(object, "command", context)?.to_string(),
-            args: optional_string_array(object, "args", context)?.unwrap_or_default(),
-            env: optional_string_map(object, "env", context)?.unwrap_or_default(),
+            command: expand_config_value(expect_non_empty_string(object, "command", context)?),
+            args: optional_string_array(object, "args", context)?
+                .unwrap_or_default()
+                .iter()
+                .map(|arg| expand_config_value(arg))
+                .collect(),
+            env: optional_string_map(object, "env", context)?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, value)| (key, expand_config_value(&value)))
+                .collect(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
@@ -972,7 +1132,7 @@ fn parse_mcp_server_config(
             object, context,
         )?)),
         "ws" => Ok(McpServerConfig::Ws(McpWebSocketServerConfig {
-            url: expect_string(object, "url", context)?.to_string(),
+            url: expand_config_value(expect_string(object, "url", context)?),
             headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
             headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
         })),
@@ -980,7 +1140,7 @@ fn parse_mcp_server_config(
             name: expect_string(object, "name", context)?.to_string(),
         })),
         "claudeai-proxy" => Ok(McpServerConfig::ManagedProxy(McpManagedProxyServerConfig {
-            url: expect_string(object, "url", context)?.to_string(),
+            url: expand_config_value(expect_string(object, "url", context)?),
             id: expect_string(object, "id", context)?.to_string(),
         })),
         other => Err(ConfigError::Parse(format!(
@@ -1002,7 +1162,7 @@ fn parse_mcp_remote_server_config(
     context: &str,
 ) -> Result<McpRemoteServerConfig, ConfigError> {
     Ok(McpRemoteServerConfig {
-        url: expect_string(object, "url", context)?.to_string(),
+        url: expand_config_value(expect_string(object, "url", context)?),
         headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
         headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
         oauth: parse_optional_mcp_oauth_config(object, context)?,
@@ -1033,6 +1193,20 @@ fn expect_object<'a>(
     value
         .as_object()
         .ok_or_else(|| ConfigError::Parse(format!("{context}: expected JSON object")))
+}
+
+fn expect_non_empty_string<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<&'a str, ConfigError> {
+    let value = expect_string(object, key, context)?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be a non-empty string"
+        )));
+    }
+    Ok(value)
 }
 
 fn expect_string<'a>(
@@ -1244,8 +1418,8 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
+        deep_merge_objects, expand_config_value, parse_permission_mode_label, ConfigLoader,
+        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
         RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
@@ -1743,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_mcp_server_shapes() {
+    fn records_invalid_mcp_server_shapes_without_rejecting_config() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1757,15 +1931,250 @@ mod tests {
         .expect("write broken settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let loaded = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
+            .expect("invalid MCP entries should not block otherwise loadable config");
 
         // then
-        assert!(error
-            .to_string()
+        assert!(loaded.mcp().servers().is_empty());
+        assert_eq!(loaded.mcp().total_configured(), 1);
+        assert_eq!(loaded.mcp().invalid_count(), 1);
+        assert!(loaded.mcp().has_invalid_servers());
+        let invalid = &loaded.mcp().invalid_servers()[0];
+        assert_eq!(invalid.name, "broken");
+        assert_eq!(invalid.scope, ConfigSource::User);
+        assert_eq!(invalid.path, home.join("settings.json"));
+        assert_eq!(invalid.error_field, "url");
+        assert!(invalid
+            .reason
             .contains("mcpServers.broken: missing string field url"));
 
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn loads_valid_mcp_servers_beside_invalid_siblings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "valid-server": {"command": "/bin/echo", "args": ["hello"]},
+                "missing-command": {"args": ["arg-only"]},
+                "empty-command": {"command": "   "},
+                "wrong-type-command": {"command": 42},
+                "bad-timeout": {"command": "/bin/echo", "toolCallTimeoutMs": "soon"},
+                "not-an-object": "nope"
+              }
+            }"#,
+        )
+        .expect("write mixed settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("valid MCP entries should load beside invalid siblings");
+
+        // then
+        assert_eq!(loaded.mcp().total_configured(), 6);
+        assert_eq!(loaded.mcp().valid_count(), 1);
+        assert_eq!(loaded.mcp().invalid_count(), 5);
+        assert!(loaded.mcp().get("valid-server").is_some());
+        let invalid_names = loaded
+            .mcp()
+            .invalid_servers()
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invalid_names,
+            vec![
+                "bad-timeout",
+                "empty-command",
+                "missing-command",
+                "not-an-object",
+                "wrong-type-command",
+            ]
+        );
+        let field_for = |name: &str| {
+            loaded
+                .mcp()
+                .invalid_servers()
+                .iter()
+                .find(|server| server.name == name)
+                .map(|server| server.error_field.clone())
+                .expect("invalid entry present")
+        };
+        assert_eq!(field_for("missing-command"), "command");
+        assert_eq!(field_for("empty-command"), "command");
+        assert_eq!(field_for("bad-timeout"), "toolCallTimeoutMs");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn invalid_project_redefinition_shadows_valid_user_mcp_server() {
+        // given: user scope defines it correctly, project scope breaks it.
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"mcpServers":{"shared":{"command":"/bin/echo"},"user-only":{"command":"/bin/true"}}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"mcpServers":{"shared":{"command":""}}}"#,
+        )
+        .expect("write project settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config loads");
+
+        // then: the broken redefinition wins (is reported), the sibling survives.
+        assert!(loaded.mcp().get("shared").is_none());
+        assert!(loaded.mcp().get("user-only").is_some());
+        assert_eq!(loaded.mcp().total_configured(), 3);
+        assert_eq!(loaded.mcp().invalid_count(), 1);
+        assert_eq!(loaded.mcp().invalid_servers()[0].scope, ConfigSource::Project);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn non_object_mcp_servers_value_is_still_fatal() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), r#"{"mcpServers":[]}"#).expect("write settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("a non-object mcpServers has nothing to salvage");
+        // Rejected by the schema validator before merge_mcp_servers runs; the
+        // point is only that it stays fatal and names the field.
+        assert!(error.to_string().contains("mcpServers"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    // ---- ${VAR} / ~ expansion (upstream 7c4bcd9) ------------------------
+
+    #[test]
+    fn expands_braced_env_var_when_set() {
+        std::env::set_var("CLAW_TEST_EXPAND_SET_7C4BCD9", "/opt/tools");
+        assert_eq!(
+            expand_config_value("${CLAW_TEST_EXPAND_SET_7C4BCD9}/bin/server"),
+            "/opt/tools/bin/server"
+        );
+        assert_eq!(
+            expand_config_value("--root=${CLAW_TEST_EXPAND_SET_7C4BCD9}"),
+            "--root=/opt/tools"
+        );
+        std::env::remove_var("CLAW_TEST_EXPAND_SET_7C4BCD9");
+    }
+
+    #[test]
+    fn unset_braced_env_var_expands_to_empty() {
+        std::env::remove_var("CLAW_TEST_EXPAND_UNSET_7C4BCD9");
+        assert_eq!(
+            expand_config_value("${CLAW_TEST_EXPAND_UNSET_7C4BCD9}/bin"),
+            "/bin"
+        );
+    }
+
+    #[test]
+    fn bare_dollar_forms_pass_through_unexpanded() {
+        std::env::set_var("CLAW_TEST_EXPAND_BARE_7C4BCD9", "should-not-appear");
+        // Only `${VAR}` expands; `$VAR` and `$$` are literal.
+        assert_eq!(
+            expand_config_value("$CLAW_TEST_EXPAND_BARE_7C4BCD9"),
+            "$CLAW_TEST_EXPAND_BARE_7C4BCD9"
+        );
+        assert_eq!(expand_config_value("cost: $$5"), "cost: $$5");
+        assert_eq!(expand_config_value("trailing $"), "trailing $");
+        std::env::remove_var("CLAW_TEST_EXPAND_BARE_7C4BCD9");
+    }
+
+    #[test]
+    fn tilde_expands_only_at_start() {
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        assert_eq!(expand_config_value("~/bin/server"), format!("{home}/bin/server"));
+        assert_eq!(expand_config_value("~"), home);
+        // Mid-string `~` is literal.
+        assert_eq!(expand_config_value("/srv/~/x"), "/srv/~/x");
+        assert_eq!(expand_config_value("a~b"), "a~b");
+    }
+
+    #[test]
+    fn plain_values_are_unchanged() {
+        assert_eq!(expand_config_value("/usr/bin/npx"), "/usr/bin/npx");
+        assert_eq!(expand_config_value(""), "");
+    }
+
+    #[test]
+    fn mcp_stdio_config_expands_command_args_env_and_remote_url() {
+        // given
+        std::env::set_var("CLAW_TEST_MCP_ROOT_7C4BCD9", "/opt/mcp");
+        std::env::set_var("CLAW_TEST_MCP_PORT_7C4BCD9", "9911");
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let claw_home = root.join("home").join(".claw");
+        fs::create_dir_all(&claw_home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            claw_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "local": {
+                  "command": "${CLAW_TEST_MCP_ROOT_7C4BCD9}/bin/server",
+                  "args": ["--data", "~/data", "--literal", "$NOPE"],
+                  "env": {"MCP_HOME": "~/mcp", "PORT": "${CLAW_TEST_MCP_PORT_7C4BCD9}"}
+                },
+                "remote": {"url": "http://127.0.0.1:${CLAW_TEST_MCP_PORT_7C4BCD9}/mcp"}
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &claw_home)
+            .load()
+            .expect("config loads");
+
+        // then
+        let McpServerConfig::Stdio(stdio) = &loaded.mcp().get("local").expect("local").config
+        else {
+            panic!("expected stdio server");
+        };
+        assert_eq!(stdio.command, "/opt/mcp/bin/server");
+        assert_eq!(
+            stdio.args,
+            vec!["--data", &format!("{home}/data"), "--literal", "$NOPE"]
+        );
+        assert_eq!(stdio.env["MCP_HOME"], format!("{home}/mcp"));
+        assert_eq!(stdio.env["PORT"], "9911");
+        let McpServerConfig::Http(http) = &loaded.mcp().get("remote").expect("remote").config
+        else {
+            panic!("expected http server");
+        };
+        assert_eq!(http.url, "http://127.0.0.1:9911/mcp");
+
+        std::env::remove_var("CLAW_TEST_MCP_ROOT_7C4BCD9");
+        std::env::remove_var("CLAW_TEST_MCP_PORT_7C4BCD9");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
