@@ -2066,12 +2066,15 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    to_slim_json(
+        write_file(&input.path, &input.content).map_err(io_to_string)?,
+        &["originalFile", "content"],
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
+    to_slim_json(
         edit_file(
             &input.path,
             &input.old_string,
@@ -2079,6 +2082,7 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
             input.replace_all.unwrap_or(false),
         )
         .map_err(io_to_string)?,
+        &["originalFile"],
     )
 }
 
@@ -2228,6 +2232,20 @@ fn run_powershell(input: PowerShellInput) -> Result<String, String> {
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+}
+
+/// Like `to_pretty_json`, minus whole-file echoes. The tool result goes back
+/// into the model's context, and `originalFile` (or a write's `content`)
+/// repeats the entire file: on a 200 KB notes file every edit cost ~16K
+/// tokens. `structuredPatch` still says what changed.
+fn to_slim_json<T: serde::Serialize>(value: T, drop: &[&str]) -> Result<String, String> {
+    let mut value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    if let Some(object) = value.as_object_mut() {
+        for key in drop {
+            object.remove(*key);
+        }
+    }
+    to_pretty_json(value)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -8897,7 +8915,10 @@ mod tests {
         let write_update_output: serde_json::Value =
             serde_json::from_str(&write_update).expect("json");
         assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        // No whole-file echoes in the model-facing result; the patch stays.
+        assert!(write_update_output.get("originalFile").is_none());
+        assert!(write_update_output.get("content").is_none());
+        assert!(write_update_output["structuredPatch"].is_array());
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
@@ -8935,6 +8956,8 @@ mod tests {
         .expect("single edit should succeed");
         let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
         assert_eq!(edit_once_output["replaceAll"], false);
+        assert!(edit_once_output.get("originalFile").is_none());
+        assert!(!edit_once_output["structuredPatch"].as_array().expect("patch").is_empty());
         assert_eq!(
             fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
             "omega\nbeta\ngamma\n"
