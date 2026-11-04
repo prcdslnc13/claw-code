@@ -566,20 +566,45 @@ fn apply_limit<T>(
     )
 }
 
+/// Lines of unchanged context kept on each side of the changed block.
+const PATCH_CONTEXT: usize = 3;
+
+/// One hunk covering the changed block plus `PATCH_CONTEXT` lines either side.
+/// The result goes back into the model's context, so it must not grow with
+/// the file: the old version listed every line twice (all `-`, then all `+`).
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
+    let old: Vec<&str> = original.lines().collect();
+    let new: Vec<&str> = updated.lines().collect();
+
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    if prefix == old.len() && prefix == new.len() {
+        return Vec::new();
+    }
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+
+    let start = prefix.saturating_sub(PATCH_CONTEXT);
+    let tail = suffix.min(PATCH_CONTEXT);
+
     let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
-    }
+    lines.extend(old[start..prefix].iter().map(|l| format!(" {l}")));
+    lines.extend(old[prefix..old_end].iter().map(|l| format!("-{l}")));
+    lines.extend(new[prefix..new_end].iter().map(|l| format!("+{l}")));
+    lines.extend(old[old_end..old_end + tail].iter().map(|l| format!(" {l}")));
 
     vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
+        old_start: start + 1,
+        old_lines: old_end + tail - start,
+        new_start: start + 1,
+        new_lines: new_end + tail - start,
         lines,
     }]
 }
@@ -707,9 +732,43 @@ mod tests {
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, make_patch, read_file, read_file_in_workspace,
+        write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
+
+    #[test]
+    fn patch_covers_only_the_changed_lines_plus_context() {
+        let old: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 50\n", "line fifty\n");
+        let hunks = make_patch(&old, &new);
+        assert_eq!(hunks.len(), 1);
+        let h = &hunks[0];
+        assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (47, 7, 47, 7));
+        assert_eq!(h.lines.len(), 8);
+        assert_eq!(h.lines[3], "-line 50");
+        assert_eq!(h.lines[4], "+line fifty");
+        assert_eq!(h.lines.iter().filter(|l| l.starts_with(' ')).count(), 6);
+    }
+
+    #[test]
+    fn patch_handles_create_insert_at_edges_and_no_change() {
+        let created = make_patch("", "a\nb\n");
+        assert_eq!(created[0].lines, vec!["+a", "+b"]);
+        assert_eq!((created[0].old_lines, created[0].new_lines), (0, 2));
+
+        let appended = make_patch("a\nb\n", "a\nb\nc\n");
+        assert_eq!(appended[0].lines, vec![" a", " b", "+c"]);
+
+        let prepended = make_patch("b\nc\n", "a\nb\nc\n");
+        assert_eq!(prepended[0].lines, vec!["+a", " b", " c"]);
+
+        // A repeated line must not be counted as both prefix and suffix.
+        let dup = make_patch("x\nx\n", "x\nx\nx\n");
+        assert_eq!(dup[0].lines.iter().filter(|l| l.starts_with('+')).count(), 1);
+        assert_eq!(dup[0].lines.iter().filter(|l| l.starts_with('-')).count(), 0);
+
+        assert!(make_patch("same\n", "same\n").is_empty());
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
